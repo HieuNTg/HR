@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { GoogleGenAI } from "@google/genai"
 
-const GEMINI_LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+const GEMINI_LIVE_MODEL = "gemini-3.1-flash-live-preview"
 const GEMINI_WS_URI =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent"
 
@@ -10,7 +10,7 @@ const GEMINI_WS_URI =
  *  Uses ephemeral token API (v1alpha). Falls back to API key for dev if unavailable.
  */
 export async function POST(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
@@ -42,14 +42,20 @@ export async function POST(
         },
       })
 
+      if (req.signal.aborted) return new Response(null, { status: 499 })
+
       if (tokenResult.name) {
         return NextResponse.json({
           token: tokenResult.name,
           wsUri: GEMINI_WS_URI,
           expiresAt: expireTime,
+          isEphemeral: true, // client must use ?access_token= (not ?key=)
         })
       }
     } catch (e) {
+      if (e instanceof Error && (e.name === "AbortError" || (e as NodeJS.ErrnoException).code === "ECONNRESET")) {
+        return new Response(null, { status: 499 })
+      }
       console.warn("Ephemeral token creation failed (falling back):", e)
 
       // In production, fail hard — do not leak the API key
@@ -58,13 +64,19 @@ export async function POST(
       }
     }
 
+    if (req.signal.aborted) return new Response(null, { status: 499 })
+
     // Dev-only fallback: return API key directly (browser uses it as ?key=)
     return NextResponse.json({
       token: apiKey,
       wsUri: GEMINI_WS_URI,
       expiresAt: null,
+      isEphemeral: false,
     })
   } catch (error) {
+    if (error instanceof Error && (error.name === "AbortError" || (error as NodeJS.ErrnoException).code === "ECONNRESET")) {
+      return new Response(null, { status: 499 })
+    }
     console.error("live-token error:", error)
     return NextResponse.json({ error: "Failed to create live token" }, { status: 500 })
   }

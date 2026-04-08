@@ -23,27 +23,36 @@ export default function InterviewSessionPage() {
   const [streamingMsgId, setStreamingMsgId] = useState<string | null>(null)
   const [spokenCharIndex, setSpokenCharIndex] = useState(0)
 
-  // Reset store if navigating to a different candidate
+  // Reset store if needed, then start interview — single effect to avoid stale closure issues
   useEffect(() => {
-    if (id && store.candidateId && store.candidateId !== id && store.step !== "idle") {
-      store.reset()
-    }
-  }, [id, store])
+    if (!id) return
 
-  // Start interview on mount — for dynamic candidates, pass data from sourcing store
-  useEffect(() => {
-    if (id && store.step === "idle") {
+    const s = useInterviewStore.getState()
+
+    // Reset if different candidate, or re-visiting same candidate after completion
+    const needsReset =
+      (s.candidateId && s.candidateId !== id && s.step !== "idle") ||
+      (s.candidateId === id && !["idle", "loading"].includes(s.step))
+    if (needsReset) s.reset()
+
+    // Start interview (reset() is synchronous so getState() now returns step="idle")
+    const current = useInterviewStore.getState()
+    if (current.step === "idle") {
       if (id.startsWith("gen-")) {
         const sourcingState = useSourcingStore.getState()
         const jd = sourcingState.jds.find((j) => j.candidates.some((c) => c.id === id))
         const candidate = jd?.candidates.find((c) => c.id === id)
         if (candidate && jd) {
-          store.startInterview(id, { candidate, jdTitle: jd.title, jdDescription: jd.description })
+          current.startInterview(id, { candidate, jdTitle: jd.title, jdDescription: jd.description })
         }
       } else {
-        store.startInterview(id)
+        current.startInterview(id)
       }
     }
+
+    // No cleanup abort — let in-flight fetch complete naturally.
+    // StrictMode guard (step !== "idle") prevents double-fetch on remount.
+    // Abort only happens via store.reset() on intentional navigation.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id])
 
@@ -110,11 +119,12 @@ export default function InterviewSessionPage() {
   const isVideoMode = store.interviewMode !== "TEXT"
 
   // Build system instruction once questions are available
-  const systemInstruction = store.questions.length > 0 && store.candidateName && store.jobTitle
+  const systemInstruction = store.candidateName && store.jobTitle
     ? buildLiveSystemInstruction({
         candidateName: store.candidateName,
         jobTitle: store.jobTitle,
-        questions: store.questions,
+        cvSummary: store.cvSummary ?? undefined,
+        jdDescription: store.jdDescription ?? undefined,
       })
     : ""
 

@@ -3,7 +3,7 @@
 import { useRef, useState, useCallback, useEffect } from "react"
 import { GeminiAudioPlayer } from "@/lib/gemini-live-audio-player"
 
-const GEMINI_LIVE_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+const GEMINI_LIVE_MODEL = "models/gemini-3.1-flash-live-preview"
 
 export type SessionStatus = "idle" | "connecting" | "active" | "error" | "closed"
 
@@ -50,6 +50,7 @@ export function useGeminiLiveSession({
   const playerRef = useRef<GeminiAudioPlayer | null>(null)
   const isConnectingRef = useRef(false)
   const userClosedRef = useRef(false)
+  const wasActiveRef = useRef(false)
   const abortControllerRef = useRef<AbortController | null>(null)
 
   // Stable callback refs
@@ -72,17 +73,19 @@ export function useGeminiLiveSession({
     playerRef.current?.close()
     playerRef.current = null
     isConnectingRef.current = false
+    wasActiveRef.current = false
     setStatus("closed")
     setIsAiSpeaking(false)
   }, [])
 
   const connect = useCallback(async () => {
-    if (isConnectingRef.current || status === "active") return
+    if (isConnectingRef.current || wsRef.current?.readyState === WebSocket.OPEN) return
     isConnectingRef.current = true
     setStatus("connecting")
 
     try {
       userClosedRef.current = false
+      wasActiveRef.current = false
       abortControllerRef.current = new AbortController()
 
       // Fetch ephemeral token from backend
@@ -91,7 +94,7 @@ export function useGeminiLiveSession({
         signal: abortControllerRef.current.signal,
       })
       if (!res.ok) throw new Error(`Token fetch failed: ${res.status}`)
-      const { token, wsUri } = await res.json()
+      const { token, wsUri, isEphemeral } = await res.json()
 
       // Setup audio player
       const player = new GeminiAudioPlayer()
@@ -99,8 +102,9 @@ export function useGeminiLiveSession({
       player.onPlayStart = () => { setIsAiSpeaking(true); onAiSpeakStartRef.current() }
       player.onPlayEnd = () => { setIsAiSpeaking(false); onAiSpeakEndRef.current() }
 
-      // Open WebSocket
-      const ws = new WebSocket(`${wsUri}?key=${token}`)
+      // Ephemeral tokens use ?access_token=; API keys use ?key=
+      const wsUrl = isEphemeral ? `${wsUri}?access_token=${token}` : `${wsUri}?key=${token}`
+      const ws = new WebSocket(wsUrl)
       wsRef.current = ws
 
       ws.onopen = () => {
@@ -113,6 +117,8 @@ export function useGeminiLiveSession({
               speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } } },
             },
             systemInstruction: { parts: [{ text: systemInstruction }] },
+            outputTranscription: {},
+            inputTranscription: {},
           },
         }))
       }
@@ -124,19 +130,26 @@ export function useGeminiLiveSession({
           // Session ready
           if ("setupComplete" in msg) {
             setStatus("active")
+            wasActiveRef.current = true
             isConnectingRef.current = false
             return
           }
 
-          // AI response content
+          // Enqueue AI audio chunks for playback
           const parts = msg.serverContent?.modelTurn?.parts ?? []
           for (const part of parts) {
             if (part.inlineData?.mimeType?.startsWith("audio/pcm") && part.inlineData.data) {
               player.enqueue(part.inlineData.data)
             }
-            if (part.text) {
-              onTranscriptRef.current(part.text, "ai")
-            }
+          }
+
+          // Use transcription fields for text (outputTranscription/inputTranscription)
+          // These are more reliable than parts[].text and avoid duplicates
+          if (msg.serverContent?.outputTranscription?.text) {
+            onTranscriptRef.current(msg.serverContent.outputTranscription.text, "ai")
+          }
+          if (msg.serverContent?.inputTranscription?.text) {
+            onTranscriptRef.current(msg.serverContent.inputTranscription.text, "candidate")
           }
 
           if (msg.serverContent?.turnComplete) {
@@ -160,7 +173,7 @@ export function useGeminiLiveSession({
         if (!e.wasClean && !userClosedRef.current) {
           onErrorRef.current(`Connection closed unexpectedly (${e.code})`)
         }
-        if (!userClosedRef.current) onSessionEndRef.current()
+        if (!userClosedRef.current && wasActiveRef.current) onSessionEndRef.current()
       }
     } catch (e) {
       if (e instanceof Error && e.name === "AbortError") return // user disconnected
@@ -169,29 +182,30 @@ export function useGeminiLiveSession({
       setStatus("error")
       isConnectingRef.current = false
     }
-  }, [status, interviewId, systemInstruction])
+  // eslint-disable-next-line react-hooks/exhaustive-deps — status removed: refs used for guards instead
+  }, [interviewId, systemInstruction])
 
   const sendAudio = useCallback((pcm16: ArrayBuffer) => {
     const ws = wsRef.current
-    if (!ws || ws.readyState !== WebSocket.OPEN || status !== "active") return
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
     // Barge-in: clear AI audio queue when user sends audio while AI is speaking
     if (playerRef.current?.speaking) playerRef.current.clear()
     ws.send(JSON.stringify({
       realtimeInput: {
-        mediaChunks: [{ mimeType: "audio/pcm;rate=16000", data: arrayBufferToBase64(pcm16) }],
+        audio: { mimeType: "audio/pcm;rate=16000", data: arrayBufferToBase64(pcm16) },
       },
     }))
-  }, [status])
+  }, [])
 
   const sendVideo = useCallback((jpegBase64: string) => {
     const ws = wsRef.current
-    if (!ws || ws.readyState !== WebSocket.OPEN || status !== "active") return
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
     ws.send(JSON.stringify({
       realtimeInput: {
-        mediaChunks: [{ mimeType: "image/jpeg", data: jpegBase64 }],
+        video: { mimeType: "image/jpeg", data: jpegBase64 },
       },
     }))
-  }, [status])
+  }, [])
 
   useEffect(() => () => { disconnect() }, [disconnect])
 

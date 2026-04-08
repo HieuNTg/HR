@@ -26,8 +26,13 @@ export async function POST(req: NextRequest) {
       questionsAndAnswers,
     )
 
+    if (req.signal.aborted) return new Response(null, { status: 499 })
+
     return NextResponse.json({ report })
   } catch (error) {
+    if (error instanceof Error && (error.name === "AbortError" || (error as NodeJS.ErrnoException).code === "ECONNRESET")) {
+      return new Response(null, { status: 499 })
+    }
     console.error("Report generation error:", error)
     return NextResponse.json(
       { error: "Không thể tạo báo cáo phỏng vấn" },

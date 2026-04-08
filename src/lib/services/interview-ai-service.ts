@@ -1,4 +1,4 @@
-import gemini from "@/lib/gemini"
+import getGemini from "@/lib/gemini"
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -37,6 +37,7 @@ export async function generateInterviewQuestions(
   cvSummary: string,
   jobTitle: string,
   jdDescription?: string,
+  signal?: AbortSignal,
 ): Promise<{ greeting: string; questions: GeneratedQuestion[] }> {
   const prompt = `${SYSTEM_CONTEXT}
 
@@ -65,30 +66,46 @@ Trả về JSON:
   ]
 }`
 
-  return gemini.generateJSON<{ greeting: string; questions: GeneratedQuestion[] }>(prompt, {
+  return getGemini().generateJSON<{ greeting: string; questions: GeneratedQuestion[] }>(prompt, {
     model: "gemini-3.1-flash-lite-preview",
     temperature: 0.7,
     maxOutputTokens: 2000,
+    signal,
   })
 }
+
+/** Fixed questions used during live (voice/video) interviews */
+export const LIVE_INTERVIEW_QUESTIONS: GeneratedQuestion[] = [
+  { questionText: "Mời bạn tự giới thiệu bản thân (tên, kinh nghiệm tổng quát, điểm nổi bật)", category: "behavioral", difficulty: "EASY" },
+  { questionText: "Hãy chia sẻ về một kinh nghiệm hoặc dự án nổi bật nhất mà bạn đã đề cập trong CV", category: "experience", difficulty: "MEDIUM" },
+  { questionText: "Bạn mong muốn môi trường làm việc như thế nào và mức lương kỳ vọng của bạn là bao nhiêu?", category: "behavioral", difficulty: "EASY" },
+]
 
 export function buildLiveSystemInstruction(params: {
   candidateName: string
   jobTitle: string
-  questions: GeneratedQuestion[]
+  cvSummary?: string
+  jdDescription?: string
 }): string {
-  const { candidateName, jobTitle, questions } = params
-  return `${SYSTEM_CONTEXT}
-Bạn đang phỏng vấn ${candidateName} cho vị trí ${jobTitle}.
+  const { candidateName, jobTitle, cvSummary, jdDescription } = params
 
-Hãy tiến hành phỏng vấn tự nhiên theo thứ tự các câu hỏi sau:
-${questions.map((q, i) => `${i + 1}. ${q.questionText}`).join("\n")}
+  const cvBlock = cvSummary ? `\n\n**Thông tin CV ứng viên:**\n${cvSummary}` : ""
+  const jdBlock = jdDescription ? `\n\n**Mô tả công việc (JD):**\n${jdDescription}` : ""
+
+  return `${SYSTEM_CONTEXT}
+Bạn đang phỏng vấn ${candidateName} cho vị trí ${jobTitle}.${cvBlock}${jdBlock}
+
+Hãy tiến hành phỏng vấn theo đúng 4 bước sau:
+1. Giới thiệu: Chào ứng viên, nhắc tên và vị trí ứng tuyển, đề cập 1 điểm nổi bật từ CV (nếu có). Mời ứng viên tự giới thiệu bản thân.
+2. Kinh nghiệm trong CV: Hỏi về một kinh nghiệm hoặc dự án nổi bật nhất mà ứng viên đã đề cập trong CV, liên hệ với yêu cầu JD.
+3. Mong muốn về môi trường làm việc và lương: Hỏi ứng viên mong muốn môi trường làm việc như thế nào và mức lương kỳ vọng.
+4. Kết thúc: Cảm ơn ứng viên đã tham gia buổi phỏng vấn, thông báo kết quả sẽ được gửi qua email trong thời gian sớm nhất.
 
 Quy tắc:
-- Bắt đầu bằng lời chào ngắn gọn (1-2 câu), nhắc tên ứng viên và vị trí
-- Hỏi từng câu một theo thứ tự, chờ ứng viên trả lời xong mới tiếp
-- Phản hồi ngắn gọn (1-2 câu) sau mỗi câu trả lời, rồi chuyển sang câu tiếp theo
-- Sau câu cuối, cảm ơn ứng viên và kết thúc buổi phỏng vấn
+- Bắt đầu bằng lời chào cá nhân hóa (2-3 câu): nhắc tên ứng viên, vị trí ứng tuyển, và nhận xét tích cực về 1 điểm nổi bật từ CV
+- Đi qua đúng 4 bước theo thứ tự, chờ ứng viên trả lời xong mới chuyển bước tiếp theo
+- Phản hồi ngắn gọn (1 câu) sau mỗi câu trả lời để thể hiện sự lắng nghe, rồi chuyển sang bước tiếp
+- Ở bước 4, sau khi nói lời cảm ơn và thông báo kết quả qua email, kết thúc buổi phỏng vấn
 - Giọng thân thiện, chuyên nghiệp, luôn dùng tiếng Việt`
 }
 
@@ -114,7 +131,7 @@ Trả về JSON:
   "improvements": ["cần cải thiện 1"]
 }`
 
-  return gemini.generateJSON<AnswerEvaluation>(prompt, {
+  return getGemini().generateJSON<AnswerEvaluation>(prompt, {
     model: "gemini-3.1-flash-lite-preview",
     temperature: 0.3,
     maxOutputTokens: 1000,
@@ -145,7 +162,7 @@ Yêu cầu:
 - Giọng văn thân thiện, chuyên nghiệp
 - CHỈ trả về text thuần, KHÔNG JSON`
 
-  return gemini.generateContent(prompt, {
+  return getGemini().generateContent(prompt, {
     model: "gemini-3.1-flash-lite-preview",
     temperature: 0.7,
     maxOutputTokens: 500,
@@ -185,7 +202,7 @@ ${qaText}
   "weaknesses": ["điểm yếu 1"]
 }`
 
-  return gemini.generateJSON<InterviewReportData>(prompt, {
+  return getGemini().generateJSON<InterviewReportData>(prompt, {
     model: "gemini-3.1-flash-lite-preview",
     temperature: 0.3,
     maxOutputTokens: 1500,

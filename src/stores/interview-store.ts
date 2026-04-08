@@ -1,5 +1,6 @@
 import { create } from "zustand"
 import type { GeneratedQuestion, AnswerEvaluation, InterviewReportData } from "@/lib/services/interview-ai-service"
+import { LIVE_INTERVIEW_QUESTIONS } from "@/lib/services/interview-ai-service"
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -38,6 +39,8 @@ interface InterviewState {
   candidateId: string | null
   candidateName: string | null
   jobTitle: string | null
+  cvSummary: string | null
+  jdDescription: string | null
 
   // Flow state
   step: InterviewStep
@@ -61,8 +64,12 @@ interface InterviewState {
   isAiSpeaking: boolean
   mediaPermission: MediaPermission
 
+  // Internal (retry support)
+  _lastDynamicPayload: { candidate: unknown; jdTitle: string; jdDescription: string } | null
+  _abortController: AbortController | null
+
   // Actions
-  startInterview: (candidateId: string, dynamicPayload?: { candidate: unknown; jdTitle: string; jdDescription: string }) => Promise<void>
+  startInterview: (candidateId: string, dynamicPayload?: { candidate: unknown; jdTitle: string; jdDescription: string }, _retryCount?: number) => Promise<void>
   retryStart: () => Promise<void>
   advanceFromGreeting: () => void
   sendAnswer: (answer: string) => Promise<void>
@@ -85,6 +92,8 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
   candidateId: null,
   candidateName: null,
   jobTitle: null,
+  cvSummary: null,
+  jdDescription: null,
   step: "idle",
   loading: false,
   error: null,
@@ -93,10 +102,12 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
   results: [],
   messages: [],
   report: null,
-  interviewMode: "TEXT",
+  interviewMode: "VOICE",
   liveSessionStatus: "idle",
   isAiSpeaking: false,
   mediaPermission: "unknown",
+  _lastDynamicPayload: null,
+  _abortController: null,
 
   advanceFromGreeting() {
     if (get().step !== "greeting") return
@@ -116,7 +127,11 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
   async startInterview(candidateId: string, dynamicPayload?: { candidate: unknown; jdTitle: string; jdDescription: string }, _retryCount = 0) {
     // Guard against double-invocation (React StrictMode / fast re-renders)
     if (_retryCount === 0 && get().step !== "idle" && get().step !== "error") return
-    set({ step: "loading", loading: true, candidateId, error: null, _lastDynamicPayload: dynamicPayload ?? null })
+
+    // Abort any in-flight request before starting a new one
+    get()._abortController?.abort()
+    const controller = new AbortController()
+    set({ step: "loading", loading: true, candidateId, error: null, _lastDynamicPayload: dynamicPayload ?? null, _abortController: controller })
 
     const MAX_RETRIES = 2
 
@@ -125,9 +140,13 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(dynamicPayload ?? {}),
+        signal: controller.signal,
       })
       if (!res.ok) throw new Error("Failed to start interview")
       const data = await res.json()
+
+      // Response fully consumed — clear controller so re-entry abort is a no-op
+      set({ _abortController: null })
 
       const greetingMsg: ChatMessage = {
         id: nextMessageId(),
@@ -139,6 +158,8 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
       set({
         candidateName: data.candidateName,
         jobTitle: data.jobTitle,
+        cvSummary: data.cvSummary ?? null,
+        jdDescription: data.jdDescription ?? null,
         questions: data.questions,
         currentQuestionIndex: 0,
         results: [],
@@ -147,9 +168,14 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
         loading: false,
       })
     } catch (error) {
+      // Client aborted (e.g. React StrictMode unmount) — reset to idle so remount can retry
+      if (error instanceof Error && error.name === "AbortError") {
+        set({ step: "idle", loading: false, _abortController: null })
+        return
+      }
+
       console.error(`Start interview error (attempt ${_retryCount + 1}/${MAX_RETRIES + 1}):`, error)
       if (_retryCount < MAX_RETRIES) {
-        // Auto-retry after a short delay
         await new Promise((r) => setTimeout(r, 1500))
         return get().startInterview(candidateId, dynamicPayload, _retryCount + 1)
       }
@@ -158,10 +184,10 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
   },
 
   async retryStart() {
-    const { candidateId, _lastDynamicPayload } = get() as InterviewState & { _lastDynamicPayload?: unknown }
+    const { candidateId, _lastDynamicPayload } = get()
     if (!candidateId) return
     set({ step: "idle", error: null })
-    await get().startInterview(candidateId, _lastDynamicPayload as never)
+    await get().startInterview(candidateId, _lastDynamicPayload ?? undefined)
   },
 
   async sendAnswer(answer: string) {
@@ -267,8 +293,8 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
   },
 
   async saveLiveResults() {
-    const { candidateId, candidateName, jobTitle, questions, messages } = get()
-    if (!candidateId || !questions.length) return
+    const { candidateId, candidateName, jobTitle, messages } = get()
+    if (!candidateId) return
 
     set({ step: "generating-report", loading: true })
 
@@ -276,7 +302,7 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
       const res = await fetch(`/api/interviews/${candidateId}/save-live-results`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transcripts: messages.map((m) => ({ role: m.role, text: m.content })), questions, candidateName, jobTitle }),
+        body: JSON.stringify({ transcripts: messages.map((m) => ({ role: m.role, text: m.content })), questions: LIVE_INTERVIEW_QUESTIONS, candidateName, jobTitle }),
       })
       if (!res.ok) throw new Error("Save live results failed")
       const data = await res.json()
@@ -297,11 +323,14 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
   },
 
   reset() {
+    get()._abortController?.abort()
     messageCounter = 0
     set({
       candidateId: null,
       candidateName: null,
       jobTitle: null,
+      cvSummary: null,
+      jdDescription: null,
       step: "idle",
       loading: false,
       error: null,
@@ -310,10 +339,12 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
       results: [],
       messages: [],
       report: null,
-      interviewMode: "TEXT",
+      interviewMode: "VOICE",
       liveSessionStatus: "idle",
       isAiSpeaking: false,
       mediaPermission: "unknown",
+      _lastDynamicPayload: null,
+      _abortController: null,
     })
   },
 }))

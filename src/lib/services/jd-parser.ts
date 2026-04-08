@@ -1,4 +1,4 @@
-import gemini from "@/lib/gemini";
+import getGemini from "@/lib/gemini";
 
 // Cấu trúc dữ liệu sau khi parse JD bằng Gemini
 export interface ParsedJdData {
@@ -66,7 +66,7 @@ Now parse this job description:
 export async function parseJobDescription(rawText: string): Promise<ParsedJdData> {
   const prompt = `${PARSE_PROMPT}\n\n${rawText}`;
 
-  const result = await gemini.generateJSON<ParsedJdData>(prompt, {
+  const result = await getGemini().generateJSON<ParsedJdData>(prompt, {
     model: "gemini-3.1-flash-lite-preview",
     temperature: 0.3,
     maxOutputTokens: 4096,

@@ -6,6 +6,7 @@ interface GenerateOptions {
   model?: GeminiModel
   temperature?: number
   maxOutputTokens?: number
+  signal?: AbortSignal
 }
 
 class GeminiClient {
@@ -20,22 +21,30 @@ class GeminiClient {
   }
 
   async generateContent(prompt: string, options: GenerateOptions = {}): Promise<string> {
-    const { model = "gemini-3.1-flash-lite-preview", temperature, maxOutputTokens } = options
-    const response = await this.client.models.generateContent({
-      model,
-      contents: prompt,
-      config: { temperature, maxOutputTokens },
-    })
+    const { model = "gemini-3.1-flash-lite-preview", temperature, maxOutputTokens, signal } = options
+    signal?.throwIfAborted()
+    const response = await this.raceAbort(
+      this.client.models.generateContent({
+        model,
+        contents: prompt,
+        config: { temperature, maxOutputTokens, httpOptions: { timeout: 30_000 } },
+      }),
+      signal,
+    )
     return response.text ?? ""
   }
 
   async generateJSON<T>(prompt: string, options: GenerateOptions = {}): Promise<T> {
-    const { model = "gemini-3.1-flash-lite-preview", temperature, maxOutputTokens } = options
-    const response = await this.client.models.generateContent({
-      model,
-      contents: prompt,
-      config: { temperature, maxOutputTokens, responseMimeType: "application/json" },
-    })
+    const { model = "gemini-3.1-flash-lite-preview", temperature, maxOutputTokens, signal } = options
+    signal?.throwIfAborted()
+    const response = await this.raceAbort(
+      this.client.models.generateContent({
+        model,
+        contents: prompt,
+        config: { temperature, maxOutputTokens, responseMimeType: "application/json", httpOptions: { timeout: 30_000 } },
+      }),
+      signal,
+    )
     const text = response.text ?? ""
     try {
       return JSON.parse(text.trim()) as T
@@ -44,6 +53,20 @@ class GeminiClient {
       if (!match) throw new Error("Failed to parse JSON from Gemini response")
       return JSON.parse(match[0]) as T
     }
+  }
+
+  /** Race a promise against an AbortSignal — rejects immediately on abort */
+  private raceAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (!signal) return promise
+    if (signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"))
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = () => reject(new DOMException("Aborted", "AbortError"))
+      signal.addEventListener("abort", onAbort, { once: true })
+      promise.then(
+        (v) => { signal.removeEventListener("abort", onAbort); resolve(v) },
+        (e) => { signal.removeEventListener("abort", onAbort); reject(e) },
+      )
+    })
   }
 
   async generateEmbedding(text: string): Promise<number[]> {
@@ -59,10 +82,11 @@ const globalForGemini = globalThis as unknown as {
   gemini: GeminiClient | undefined
 }
 
-export const gemini = globalForGemini.gemini ?? new GeminiClient()
-
-if (process.env.NODE_ENV !== "production") {
-  globalForGemini.gemini = gemini
+export function getGemini(): GeminiClient {
+  if (!globalForGemini.gemini) {
+    globalForGemini.gemini = new GeminiClient()
+  }
+  return globalForGemini.gemini
 }
 
-export default gemini
+export default getGemini

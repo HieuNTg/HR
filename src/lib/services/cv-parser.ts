@@ -1,4 +1,4 @@
-import gemini from "@/lib/gemini";
+import getGemini from "@/lib/gemini";
 import { parsedCvDataSchema, type ParsedCvData } from "@/lib/validations/cv";
 
 const PARSE_PROMPT = `You are an expert HR analyst. Extract structured data from this CV/resume.
@@ -35,7 +35,7 @@ Now parse this CV:
 export async function parseCvText(rawText: string): Promise<ParsedCvData> {
   const prompt = `${PARSE_PROMPT}\n\n${rawText}`;
 
-  const raw = await gemini.generateJSON<unknown>(prompt, {
+  const raw = await getGemini().generateJSON<unknown>(prompt, {
     model: "gemini-3.1-flash-lite-preview",
     temperature: 0.3,
     maxOutputTokens: 4096,

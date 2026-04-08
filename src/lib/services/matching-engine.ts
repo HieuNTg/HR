@@ -1,4 +1,4 @@
-import gemini from "@/lib/gemini";
+import getGemini from "@/lib/gemini";
 import type { ParsedJdData } from "./jd-parser";
 import type { ParsedCvData } from "@/lib/validations/cv";
 
@@ -98,7 +98,7 @@ Respond ONLY with JSON:
   let recommendedFocusAreas: string[] = [];
 
   try {
-    const semantic = await gemini.generateJSON<{
+    const semantic = await getGemini().generateJSON<{
       strengths: string[];
       gaps: string[];
       recommendedFocusAreas: string[];

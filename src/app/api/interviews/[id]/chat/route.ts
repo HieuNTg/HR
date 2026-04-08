@@ -28,6 +28,8 @@ export async function POST(req: NextRequest) {
       nextQuestion,
     )
 
+    if (req.signal.aborted) return new Response(null, { status: 499 })
+
     return NextResponse.json({
       aiResponse,
       evaluation: {
@@ -38,6 +40,9 @@ export async function POST(req: NextRequest) {
       },
     })
   } catch (error) {
+    if (error instanceof Error && (error.name === "AbortError" || (error as NodeJS.ErrnoException).code === "ECONNRESET")) {
+      return new Response(null, { status: 499 })
+    }
     console.error("Chat error:", error)
     return NextResponse.json(
       { error: "Không thể xử lý câu trả lời" },

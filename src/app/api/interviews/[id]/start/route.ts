@@ -53,7 +53,13 @@ export async function POST(
       cvContext,
       jd.title,
       jd.description,
+      req.signal,
     )
+
+    // Client disconnected while Gemini was generating — don't write to closed socket
+    if (req.signal.aborted) {
+      return new Response(null, { status: 499 })
+    }
 
     return NextResponse.json({
       interviewId: `interview-${id}`,
@@ -62,8 +68,19 @@ export async function POST(
       jobTitle: jd.title,
       greeting,
       questions,
+      cvSummary: cvContext,
+      jdDescription: jd.description,
     })
   } catch (error) {
+    // Client disconnected — swallow silently
+    if (
+      error instanceof Error &&
+      (error.name === "AbortError" ||
+        (error as NodeJS.ErrnoException).code === "ECONNRESET" ||
+        (error as NodeJS.ErrnoException).code === "ABORT_ERR")
+    ) {
+      return new Response(null, { status: 499 })
+    }
     console.error("Interview start error:", error)
     return NextResponse.json(
       { error: "Không thể tạo câu hỏi phỏng vấn" },

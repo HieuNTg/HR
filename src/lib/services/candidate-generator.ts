@@ -4,7 +4,7 @@
  * scoring breakdowns ready for display.
  */
 
-import gemini from "@/lib/gemini"
+import getGemini from "@/lib/gemini"
 import type { MockSourcingCandidate } from "@/lib/mock-data/mock-candidates-sourcing"
 
 const PLATFORMS = ["linkedin", "topcv", "vnworks"] as const
@@ -60,7 +60,7 @@ QUAN TRỌNG:
 - education.level chỉ dùng: "Cao đẳng", "Đại học", "Thạc sĩ", "Tiến sĩ"
 - Trả về THUẦN JSON array, KHÔNG markdown, KHÔNG giải thích`
 
-  const raw = await gemini.generateContent(prompt, { model: "gemini-3.1-flash-lite-preview" })
+  const raw = await getGemini().generateContent(prompt, { model: "gemini-3.1-flash-lite-preview" })
 
   // Parse JSON from response (handle markdown code blocks)
   let jsonStr = raw.trim()
