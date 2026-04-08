@@ -140,4 +140,41 @@ AI-powered recruitment system automating interview workflows: job analysis → c
    ↓
 3. Backend returns ephemeral token + WebSocket URI
    ↓
-4. Frontend loads audio-proc
+4. Frontend loads audio-processor.js as AudioWorklet
+   ↓
+5. Mic capture via pcm-processor → Int16 PCM chunks
+   ↓
+6. WebSocket stream to Gemini Live (gemini-2.5-flash-native-audio-preview)
+   ↓
+7. Gemini evaluates answers in real-time
+   ↓
+8. Results → Database via API
+```
+
+## Dependencies (phase-01-deps-token)
+
+- **@google/genai:** Gemini SDK (replaced @google/generative-ai)
+- **next.js:** Full-stack framework
+- **prisma:** Database ORM
+- **typescript:** Type safety
+
+## Security Notes
+
+- Ephemeral tokens: v1alpha API, short-lived (30min), single-use
+- Production: Never falls back to API key (fails with 503)
+- Dev: API key fallback for testing without token service
+- WebSocket: Candidate credentials isolated per token
+
+## Configuration
+
+**Environment Variables:**
+- `GEMINI_API_KEY` — Required for SDK initialization
+- `NODE_ENV` — Controls ephemeral token fallback behavior
+
+## Next Steps (Post-Phase-05)
+
+- Holistic evaluation: Replace per-question eval with transcript-wide assessment (4 dimensions: communication, reasoning, technical, culture fit)
+- MediaRecorder parallel track: Record WebM/OGG alongside PCM16 stream for local `uploads/` storage
+- Enhanced system instruction: AI evaluates CV consistency, communication style, culture fit during interview
+- Dashboard: Multi-candidate scoring & comparison with video/text mode metrics
+- Session monitoring: Track Gemini Live API usage and session duration limits
