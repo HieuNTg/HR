@@ -52,8 +52,6 @@ export function useGeminiLiveSession({
   const userClosedRef = useRef(false)
   const wasActiveRef = useRef(false)
   const abortControllerRef = useRef<AbortController | null>(null)
-  const triggerRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const initialTriggerPendingRef = useRef(false)
 
   // Stable callback refs
   const onTranscriptRef = useRef(onTranscript)
@@ -70,7 +68,6 @@ export function useGeminiLiveSession({
   const disconnect = useCallback(() => {
     userClosedRef.current = true
     abortControllerRef.current?.abort()
-    if (triggerRetryRef.current) { clearTimeout(triggerRetryRef.current); triggerRetryRef.current = null }
     wsRef.current?.close()
     wsRef.current = null
     playerRef.current?.close()
@@ -102,11 +99,7 @@ export function useGeminiLiveSession({
       // Setup audio player
       const player = new GeminiAudioPlayer()
       playerRef.current = player
-      player.onPlayStart = () => {
-        // AI responded — clear retry timeout
-        if (triggerRetryRef.current) { clearTimeout(triggerRetryRef.current); triggerRetryRef.current = null }
-        setIsAiSpeaking(true); onAiSpeakStartRef.current()
-      }
+      player.onPlayStart = () => { setIsAiSpeaking(true); onAiSpeakStartRef.current() }
       player.onPlayEnd = () => { setIsAiSpeaking(false); onAiSpeakEndRef.current() }
 
       // Ephemeral tokens use ?access_token=; API keys use ?key=
@@ -133,38 +126,22 @@ export function useGeminiLiveSession({
         ws.send(JSON.stringify(setupMsg))
       }
 
-      ws.onmessage = (event: MessageEvent) => {
+      const handleMessage = async (event: MessageEvent) => {
+        // Gemini Live API sends binary Blob frames — must convert to text before parsing
+        const raw: string = event.data instanceof Blob
+          ? await event.data.text()
+          : event.data as string
         try {
-          const msg = JSON.parse(event.data as string)
+          const msg = JSON.parse(raw)
           console.log("[gemini-ws] msg keys:", Object.keys(msg).join(","))
 
-          // Session ready — send text turn to trigger AI's opening greeting
+          // Session ready — mic audio from media capture will flow in automatically.
+          // Native audio models (gemini-*-live-*) use VAD: they respond when real speech arrives.
+          // clientContent text turns are unsupported by this model family and cause a 1007 close.
           if ("setupComplete" in msg) {
             setStatus("active")
             wasActiveRef.current = true
             isConnectingRef.current = false
-
-            // Send clientContent text turn to trigger Gemini's first response per system instruction
-            initialTriggerPendingRef.current = true
-            ws.send(JSON.stringify({
-              clientContent: {
-                turns: [{ role: "user", parts: [{ text: "Xin chào, tôi đã sẵn sàng cho buổi phỏng vấn." }] }],
-                turnComplete: true,
-              },
-            }))
-
-            // Retry if AI hasn't responded within 8s
-            triggerRetryRef.current = setTimeout(() => {
-              if (ws.readyState === WebSocket.OPEN && !playerRef.current?.speaking) {
-                ws.send(JSON.stringify({
-                  clientContent: {
-                    turns: [{ role: "user", parts: [{ text: "Xin chào" }] }],
-                    turnComplete: true,
-                  },
-                }))
-              }
-            }, 8000)
-
             return
           }
 
@@ -181,12 +158,7 @@ export function useGeminiLiveSession({
             onTranscriptRef.current(msg.outputTranscription.text, "ai")
           }
           if (msg.inputTranscription?.text) {
-            // Skip echoed initial trigger — don't show as candidate message
-            if (initialTriggerPendingRef.current) {
-              initialTriggerPendingRef.current = false
-            } else {
-              onTranscriptRef.current(msg.inputTranscription.text, "candidate")
-            }
+            onTranscriptRef.current(msg.inputTranscription.text, "candidate")
           }
 
           if (msg.serverContent?.turnComplete) {
@@ -200,9 +172,11 @@ export function useGeminiLiveSession({
             ws.close()
           }
         } catch {
-          // Non-JSON frame (binary audio) — ignore; audio arrives as base64 in JSON
+          // Non-JSON frame — ignore
         }
       }
+
+      ws.onmessage = handleMessage
 
       ws.onerror = () => {
         onErrorRef.current("WebSocket connection error")

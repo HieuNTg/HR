@@ -40,11 +40,21 @@ export function VideoInterviewInterface({
   const [sessionError, setSessionError] = useState<string | null>(null)
   const [isCameraOff, setIsCameraOff] = useState(false)
   const transcriptEndRef = useRef<HTMLDivElement | null>(null)
+  const hasTranscriptsRef = useRef(false)
 
   const handleTranscript = useCallback((text: string, role: "ai" | "candidate") => {
+    hasTranscriptsRef.current = true
     setTranscripts((prev) => [...prev, { role, text, timestamp: new Date() }])
     onTranscript(text, role)
   }, [onTranscript])
+
+  // Only trigger onSessionEnd if the interview actually started (has transcripts).
+  // Prevents generating empty reports when the connection drops before anyone speaks.
+  const handleSessionEnd = useCallback(() => {
+    if (hasTranscriptsRef.current) {
+      onSessionEnd()
+    }
+  }, [onSessionEnd])
 
   const session = useGeminiLiveSession({
     interviewId,
@@ -53,7 +63,7 @@ export function VideoInterviewInterface({
     onAiSpeakStart: () => setIsAiSpeaking(true),
     onAiSpeakEnd: () => setIsAiSpeaking(false),
     onError: setSessionError,
-    onSessionEnd,
+    onSessionEnd: handleSessionEnd,
   })
 
   const media = useMediaCapture({
@@ -61,19 +71,24 @@ export function VideoInterviewInterface({
     onVideoFrame: session.sendVideo,
   })
 
-  // One-shot connect on mount — re-running would cause reconnect loops
+  const [started, setStarted] = useState(false)
+
+  // Called from a button click — satisfies Chrome's AudioContext autoplay policy.
+  // AudioContext created inside getUserMedia / AudioWorklet setup MUST be triggered
+  // by a user gesture, otherwise it stays suspended and captures/plays no audio.
+  const handleStart = useCallback(async () => {
+    setStarted(true)
+    await session.connect()
+    await media.start()
+  }, [session, media])
+
+  // Cleanup on unmount
   useEffect(() => {
-    if (disabled) return
-    let cancelled = false
-    session.connect()
-      .then(() => { if (!cancelled) media.start() })
-      .catch(() => {}) // errors surface via session.onError → sessionError state
     return () => {
-      cancelled = true
       session.disconnect()
       media.stop()
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps — intentional one-shot
+    // eslint-disable-next-line react-hooks/exhaustive-deps — intentional cleanup-only
   }, [])
 
   // Auto-scroll transcript to latest message
@@ -92,8 +107,34 @@ export function VideoInterviewInterface({
 
   const handleEndCall = useCallback(() => {
     session.disconnect()
-    onSessionEnd()
-  }, [session, onSessionEnd])
+    handleSessionEnd()
+  }, [session, handleSessionEnd])
+
+  // ── Pre-start screen — must click to satisfy Chrome AudioContext autoplay policy ──
+  if (!started) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-5 p-8 text-center min-h-[300px] h-full">
+        <div className="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center">
+          <Mic className="w-7 h-7 text-primary" />
+        </div>
+        <div className="space-y-1.5">
+          <p className="text-base font-semibold">Sẵn sàng bắt đầu phỏng vấn?</p>
+          <p className="text-sm text-muted-foreground max-w-xs">
+            Nhấn bắt đầu để kết nối mic, camera và AI phỏng vấn.
+          </p>
+        </div>
+        <button
+          onClick={handleStart}
+          className="px-6 py-2.5 rounded-full bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors"
+        >
+          Bắt đầu phỏng vấn
+        </button>
+        <button onClick={onFallbackToText} className="text-xs text-muted-foreground underline hover:no-underline">
+          Dùng chế độ văn bản thay thế
+        </button>
+      </div>
+    )
+  }
 
   // ── Permission denied fallback ────────────────────────────────────────
   if (media.status === "denied") {
@@ -187,7 +228,7 @@ export function VideoInterviewInterface({
           {transcripts.length === 0 ? (
             <p className="text-xs text-muted-foreground text-center py-6 px-4">
               {session.status === "connecting" ? "Đang kết nối..." :
-               session.status === "active" ? "Đang chờ AI phản hồi..." :
+               session.status === "active" ? "Nói để bắt đầu phỏng vấn — AI sẽ chào bạn" :
                "Cuộc trò chuyện chưa bắt đầu"}
             </p>
           ) : (
