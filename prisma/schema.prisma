@@ -1,0 +1,388 @@
+// Prisma schema for AI HR Interview System
+// Provider: PostgreSQL
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  CANDIDATE
+  RECRUITER
+  ADMIN
+}
+
+enum JobStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum EmploymentType {
+  FULL_TIME
+  PART_TIME
+  CONTRACT
+  INTERNSHIP
+  FREELANCE
+}
+
+enum RequirementType {
+  TECHNICAL
+  SOFT
+  EXPERIENCE
+  EDUCATION
+  CERTIFICATION
+}
+
+enum CandidateStatus {
+  NEW
+  SCREENING
+  INTERVIEWED
+  OFFERED
+  HIRED
+  REJECTED
+  WITHDRAWN
+}
+
+enum ParsingStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum SkillCategory {
+  TECHNICAL
+  SOFT
+  LANGUAGE
+  TOOL
+}
+
+enum InterviewStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  EXPIRED
+}
+
+enum InterviewMode {
+  TEXT
+  VOICE
+  HYBRID
+}
+
+enum Difficulty {
+  EASY
+  MEDIUM
+  HARD
+}
+
+enum Recommendation {
+  STRONGLY_RECOMMEND
+  RECOMMEND
+  CONSIDER
+  REJECT
+}
+
+enum AuditStatus {
+  SUCCESS
+  FAILURE
+}
+
+// ─── Models ───────────────────────────────────────────────────────────────────
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String
+  role         UserRole  @default(CANDIDATE)
+  firstName    String
+  lastName     String
+  company      String?
+  isActive     Boolean   @default(true)
+  lastLogin    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  candidate     Candidate?
+  jobPositions  JobPosition[]
+  auditLogs     AuditLog[]
+
+  @@index([email])
+  @@index([role])
+  @@map("users")
+}
+
+model JobPosition {
+  id                String         @id @default(cuid())
+  title             String
+  department        String?
+  location          String?
+  employmentType    EmploymentType @default(FULL_TIME)
+  description       String?
+  rawJdText         String?
+  parsedData        Json?
+  evaluationRubric  Json?
+  interviewSettings Json           @default("{}")
+  status            JobStatus      @default(DRAFT)
+  createdById       String
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  createdBy     User               @relation(fields: [createdById], references: [id])
+  requirements  JobRequirement[]
+  interviews    Interview[]
+  reports       InterviewReport[]
+
+  @@index([status])
+  @@index([createdById])
+  @@map("job_positions")
+}
+
+model JobRequirement {
+  id           String          @id @default(cuid())
+  jobId        String
+  type         RequirementType
+  name         String
+  description  String?
+  level        String?
+  yearsRequired Int?
+  isRequired   Boolean         @default(true)
+  weight       Float           @default(1.0)
+  createdAt    DateTime        @default(now())
+
+  job       JobPosition         @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  questions InterviewQuestion[]
+
+  @@index([jobId])
+  @@map("job_requirements")
+}
+
+model Candidate {
+  id            String          @id @default(cuid())
+  userId        String          @unique
+  firstName     String
+  lastName      String
+  email         String          @unique
+  phone         String?
+  linkedinUrl   String?
+  portfolioUrl  String?
+  currentStatus CandidateStatus @default(NEW)
+  source        String?
+  notes         String?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  user       User              @relation(fields: [userId], references: [id])
+  cvs        CV[]
+  interviews Interview[]
+  reports    InterviewReport[]
+
+  @@index([email])
+  @@index([currentStatus])
+  @@map("candidates")
+}
+
+model CV {
+  id            String        @id @default(cuid())
+  candidateId   String
+  fileUrl       String
+  fileName      String
+  fileSize      Int
+  rawText       String?
+  parsedData    Json?
+  parsingStatus ParsingStatus @default(PENDING)
+  parsingError  String?
+  uploadedAt    DateTime      @default(now())
+  processedAt   DateTime?
+
+  candidate Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  skills    CvSkill[]
+
+  @@index([candidateId])
+  @@index([parsingStatus])
+  @@map("cvs")
+}
+
+model CvSkill {
+  id               String        @id @default(cuid())
+  cvId             String
+  skillName        String
+  skillCategory    SkillCategory @default(TECHNICAL)
+  proficiencyLevel String?
+  yearsExperience  Float?
+  sourceSection    String?
+  confidenceScore  Float?
+
+  cv CV @relation(fields: [cvId], references: [id], onDelete: Cascade)
+
+  @@index([cvId])
+  @@index([skillName])
+  @@map("cv_skills")
+}
+
+model Interview {
+  id              String          @id @default(cuid())
+  candidateId     String
+  jobId           String
+  roundNumber     Int             @default(1)
+  status          InterviewStatus @default(SCHEDULED)
+  mode            InterviewMode   @default(TEXT)
+  language        String          @default("en")
+  settings        Json            @default("{}")
+  scheduledAt     DateTime?
+  startedAt       DateTime?
+  completedAt     DateTime?
+  durationSeconds Int?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  candidate  Candidate          @relation(fields: [candidateId], references: [id])
+  job        JobPosition        @relation(fields: [jobId], references: [id])
+  questions  InterviewQuestion[]
+  report     InterviewReport?
+  analytics  InterviewAnalytics?
+
+  @@unique([candidateId, jobId, roundNumber])
+  @@index([status])
+  @@index([candidateId])
+  @@index([jobId])
+  @@map("interviews")
+}
+
+model InterviewQuestion {
+  id                     String     @id @default(cuid())
+  interviewId            String
+  questionText           String
+  questionCategory       String?
+  questionType           String?
+  difficulty             Difficulty @default(MEDIUM)
+  orderIndex             Int
+  relatedRequirementId   String?
+  expectedAnswerCriteria Json?
+  followUpPrompts        Json?
+  maxScore               Int        @default(100)
+  createdAt              DateTime   @default(now())
+
+  interview          Interview          @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  relatedRequirement JobRequirement?    @relation(fields: [relatedRequirementId], references: [id])
+  answer             InterviewAnswer?
+
+  @@index([interviewId])
+  @@index([orderIndex])
+  @@map("interview_questions")
+}
+
+model InterviewAnswer {
+  id                     String   @id @default(cuid())
+  questionId             String   @unique
+  answerText             String?
+  audioUrl               String?
+  durationSeconds        Int?
+  wordCount              Int?
+  answeredAt             DateTime @default(now())
+  transcriptionConfidence Float?
+
+  question   InterviewQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  evaluation AnswerEvaluation?
+
+  @@map("interview_answers")
+}
+
+model AnswerEvaluation {
+  id              String   @id @default(cuid())
+  answerId        String   @unique
+  score           Int
+  maxScore        Int      @default(100)
+  scoreAccuracy   Int
+  scoreCompleteness Int
+  scoreClarity    Int
+  scoreDepth      Int
+  analysisDetails Json?
+  needsFollowUp   Boolean  @default(false)
+  followUpQuestion String?
+  evaluatedAt     DateTime @default(now())
+
+  answer InterviewAnswer @relation(fields: [answerId], references: [id], onDelete: Cascade)
+
+  @@map("answer_evaluations")
+}
+
+model InterviewReport {
+  id                  String         @id @default(cuid())
+  interviewId         String         @unique
+  candidateId         String
+  jobId               String
+  overallScore        Float
+  scoreTechnical      Float?
+  scoreExperience     Float?
+  scoreCommunication  Float?
+  scoreProblemSolving Float?
+  scoreCultureFit     Float?
+  dimensionScores     Json?
+  strengths           Json?
+  weaknesses          Json?
+  redFlags            Json?
+  highlights          Json?
+  recommendation      Recommendation
+  recommendationReason String?
+  detailedAnalysis    Json?
+  comparisonData      Json?
+  transcript          Json?
+  generatedAt         DateTime       @default(now())
+
+  interview Interview @relation(fields: [interviewId], references: [id])
+  candidate Candidate @relation(fields: [candidateId], references: [id])
+  job       JobPosition @relation(fields: [jobId], references: [id])
+
+  @@index([candidateId])
+  @@index([jobId])
+  @@index([recommendation])
+  @@map("interview_reports")
+}
+
+model InterviewAnalytics {
+  id                        String   @id @default(cuid())
+  interviewId               String   @unique
+  totalQuestions            Int
+  questionsAnswered         Int
+  averageResponseTimeSeconds Float?
+  totalWordsSpoken          Int?
+  sentimentTrend            Json?
+  difficultyProgression     Json?
+  scoreProgression          Json?
+  completionRate            Float?
+  createdAt                 DateTime @default(now())
+
+  interview Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+
+  @@map("interview_analytics")
+}
+
+model AuditLog {
+  id           String      @id @default(cuid())
+  userId       String?
+  action       String
+  resourceType String
+  resourceId   String?
+  ipAddress    String?
+  userAgent    String?
+  changes      Json?
+  status       AuditStatus @default(SUCCESS)
+  errorMessage String?
+  timestamp    DateTime    @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([resourceType, resourceId])
+  @@index([timestamp])
+  @@map("audit_logs")
+}

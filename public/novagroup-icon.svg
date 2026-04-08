@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" fill="none">
+  <rect width="40" height="40" rx="8" fill="#fff"/>
+  <!-- 3D cube Nova logo approximation -->
+  <!-- Top diamond face -->
+  <polygon points="20,4 32,12 20,20 8,12" fill="#8cc541"/>
+  <!-- Left face with N -->
+  <polygon points="8,12 20,20 20,36 8,28" fill="#6fa234"/>
+  <!-- Right face -->
+  <polygon points="20,20 32,12 32,28 20,36" fill="#7ab83c"/>
+  <!-- White edge lines for 3D effect -->
+  <polyline points="8,12 20,20 32,12" fill="none" stroke="#fff" stroke-width="0.8"/>
+  <line x1="20" y1="20" x2="20" y2="36" stroke="#fff" stroke-width="0.8"/>
+  <!-- N letter on left face -->
+  <path d="M11,15 L11,25 L13,25 L13,19 L17,25 L19,25 L19,15 L17,15 L17,21 L13,15 Z" fill="#fff" opacity="0.9"/>
+  <!-- Top triangle cutout hint -->
+  <polygon points="20,7 23,9 17,9" fill="#fff" opacity="0.3"/>
+</svg>
