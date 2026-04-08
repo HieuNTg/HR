@@ -3,6 +3,8 @@
  * Decodes base64 PCM16 24kHz chunks and plays them gaplessly via Web Audio API.
  */
 
+import { int16ToFloat32, base64ToPcm } from "@/lib/audio-utils"
+
 const GEMINI_OUTPUT_SAMPLE_RATE = 24000 // Gemini outputs 24kHz PCM16
 
 export class GeminiAudioPlayer {
@@ -10,7 +12,8 @@ export class GeminiAudioPlayer {
   private nextPlayTime = 0
   private isPlaying = false
   private pendingChunks = 0
-  private epoch = 0 // incremented on clear() to invalidate stale onended callbacks
+  // AbortController signals stale onended callbacks after clear() is called
+  private abortController = new AbortController()
 
   onPlayStart?: () => void
   onPlayEnd?: () => void
@@ -22,22 +25,23 @@ export class GeminiAudioPlayer {
     return this.ctx
   }
 
-  /** Decode base64 PCM16 → Float32Array */
+  /** Decode base64 PCM16 → Float32Array (uses shared audio-utils to avoid duplication) */
   private decodeChunk(base64: string): Float32Array {
-    const binary = atob(base64)
-    const bytes = new Uint8Array(binary.length)
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+    return int16ToFloat32(base64ToPcm(base64))
+  }
 
-    const int16 = new Int16Array(bytes.buffer)
-    const float32 = new Float32Array(int16.length)
-    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0
-    return float32
+  /** Pre-warm the AudioContext inside a user-gesture callback to avoid autoplay suspension */
+  async warmUp(): Promise<void> {
+    const ctx = this.ensureContext()
+    if (ctx.state === "suspended") await ctx.resume()
   }
 
   /** Enqueue and schedule a PCM16 audio chunk for gapless playback */
   enqueue(base64Pcm16: string): void {
     const ctx = this.ensureContext()
-    if (ctx.state === "suspended") ctx.resume()
+    // warmUp() should have been called in a user-gesture context first.
+    // Resume here as a best-effort fallback (may be a no-op if already running).
+    if (ctx.state === "suspended") ctx.resume().catch(() => {})
 
     const float32 = this.decodeChunk(base64Pcm16)
     if (float32.length === 0) return
@@ -60,9 +64,11 @@ export class GeminiAudioPlayer {
       this.onPlayStart?.()
     }
 
-    const capturedEpoch = this.epoch
+    // Capture signal at enqueue time — if clear() is called before this source ends,
+    // the signal will be aborted and onended becomes a no-op.
+    const { signal } = this.abortController
     source.onended = () => {
-      if (capturedEpoch !== this.epoch) return // invalidated by clear()
+      if (signal.aborted) return
       this.pendingChunks--
       if (this.pendingChunks <= 0) {
         this.pendingChunks = 0
@@ -75,7 +81,10 @@ export class GeminiAudioPlayer {
 
   /** Stop all playback immediately (barge-in / interrupt) */
   clear(): void {
-    this.epoch++ // invalidate all pending onended callbacks
+    // Abort all pending onended callbacks
+    this.abortController.abort()
+    this.abortController = new AbortController()
+
     this.nextPlayTime = 0
     this.pendingChunks = 0
     if (this.isPlaying) {

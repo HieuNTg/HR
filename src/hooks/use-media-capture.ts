@@ -1,14 +1,15 @@
 "use client"
 
 import { useRef, useState, useCallback, useEffect } from "react"
+import { float32ToInt16 } from "@/lib/audio-utils"
+import { captureFrame } from "@/lib/video-utils"
 
 export interface UseMediaCaptureOptions {
   onAudioChunk: (pcm16: ArrayBuffer) => void
   onVideoFrame: (jpegBase64: string) => void
-  videoFps?: number        // default 1
-  videoWidth?: number      // default 768
-  videoHeight?: number     // default 768
-  audioSampleRate?: number // default 16000
+  videoFps?: number      // default 1
+  videoWidth?: number    // default 768
+  videoHeight?: number   // default 768
 }
 
 export type CaptureStatus = "idle" | "requesting" | "active" | "error" | "denied"
@@ -32,7 +33,6 @@ export function useMediaCapture({
   videoFps = 1,
   videoWidth = 768,
   videoHeight = 768,
-  audioSampleRate = 16000,
 }: UseMediaCaptureOptions): UseMediaCaptureReturn {
   const [status, setStatus] = useState<CaptureStatus>("idle")
   const [error, setError] = useState<string | null>(null)
@@ -45,7 +45,6 @@ export function useMediaCapture({
   const audioCtxRef = useRef<AudioContext | null>(null)
   const workletNodeRef = useRef<AudioWorkletNode | null>(null)
   const videoIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const recorderRef = useRef<MediaRecorder | null>(null)
   const recordedChunksRef = useRef<Blob[]>([])
   const isMutedRef = useRef(false)
@@ -99,7 +98,7 @@ export function useMediaCapture({
 
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: { ideal: videoWidth }, height: { ideal: videoHeight }, facingMode: "user" },
-        audio: { sampleRate: audioSampleRate, channelCount: 1, echoCancellation: true },
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
       })
       streamRef.current = stream
 
@@ -110,34 +109,34 @@ export function useMediaCapture({
       }
 
       // ── AudioWorklet setup ──────────────────────────────────────────────
-      const audioCtx = new AudioContext({ sampleRate: audioSampleRate })
+      // Do NOT pass sampleRate hint — browsers ignore it and it can cause issues.
+      // The worklet reads the actual sampleRate global and resamples to 16kHz internally.
+      const audioCtx = new AudioContext()
       audioCtxRef.current = audioCtx
       if (audioCtx.state === "suspended") await audioCtx.resume()
-      await audioCtx.audioWorklet.addModule("/audio-processor.js")
+      await audioCtx.audioWorklet.addModule("/audio-worklet.js")
 
       const source = audioCtx.createMediaStreamSource(stream)
-      const workletNode = new AudioWorkletNode(audioCtx, "pcm-processor")
+      const workletNode = new AudioWorkletNode(audioCtx, "mic-processor")
       workletNodeRef.current = workletNode
 
-      workletNode.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
-        if (!isMutedRef.current) onAudioChunkRef.current(e.data)
+      // Worklet posts { type:'audio', samples:Float32Array, sampleRate:16000 }
+      // Convert Float32 → Int16 here and pass the buffer to the session hook
+      workletNode.port.onmessage = (e: MessageEvent<{ type: string; samples: Float32Array; sampleRate: number }>) => {
+        if (e.data.type !== "audio") return
+        if (isMutedRef.current) return
+        const int16 = float32ToInt16(e.data.samples)
+        onAudioChunkRef.current(int16.buffer as ArrayBuffer)
       }
       source.connect(workletNode)
-      // No connect to destination — we only want to capture, not play back mic
+      // No connect to destination — capture only, no mic playback
 
       // ── Video frame capture ─────────────────────────────────────────────
-      if (!canvasRef.current) canvasRef.current = document.createElement("canvas")
-      const canvas = canvasRef.current
-      canvas.width = videoWidth
-      canvas.height = videoHeight
-      const ctx2d = canvas.getContext("2d")!
-
       videoIntervalRef.current = setInterval(() => {
         const video = videoRef.current
         if (!video || video.readyState < 2) return
-        ctx2d.drawImage(video, 0, 0, videoWidth, videoHeight)
-        const dataUrl = canvas.toDataURL("image/jpeg", 0.85)
-        onVideoFrameRef.current(dataUrl.split(",")[1]) // strip data:image/jpeg;base64,
+        const frame = captureFrame(video, videoWidth, videoHeight)
+        onVideoFrameRef.current(frame)
       }, Math.round(1000 / videoFps))
 
       // ── MediaRecorder for audio saving (WebM/OGG) ──────────────────────
@@ -161,7 +160,7 @@ export function useMediaCapture({
     } finally {
       isStartingRef.current = false
     }
-  }, [status, videoWidth, videoHeight, audioSampleRate, videoFps, stop])
+  }, [status, videoWidth, videoHeight, videoFps, stop])
 
   const toggleMute = useCallback(() => {
     const track = streamRef.current?.getAudioTracks()[0]

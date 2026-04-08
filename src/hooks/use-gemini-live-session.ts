@@ -2,8 +2,23 @@
 
 import { useRef, useState, useCallback, useEffect } from "react"
 import { GeminiAudioPlayer } from "@/lib/gemini-live-audio-player"
+import { uint8ToBase64 } from "@/lib/audio-utils"
 
 const GEMINI_LIVE_MODEL = "models/gemini-3.1-flash-live-preview"
+
+// 32ms of silence at 16kHz = 512 samples × 2 bytes = 1024 bytes
+const SILENCE_FALLBACK_PCM = new Int16Array(512) // all zeros
+
+/** Human-readable WebSocket close code labels (Vietnamese for production UI) */
+const WS_CLOSE_REASONS: Record<number, string> = {
+  1000: "Phiên kết thúc bình thường",
+  1006: "Mất kết nối mạng",
+  1007: "Lỗi giao thức — vui lòng liên hệ hỗ trợ",
+  1008: "Vi phạm chính sách",
+  1011: "Lỗi server Gemini — thử lại sau",
+  1012: "Server đang khởi động lại",
+  1013: "Server quá tải",
+}
 
 export type SessionStatus = "idle" | "connecting" | "active" | "error" | "closed"
 
@@ -23,16 +38,13 @@ export interface UseGeminiLiveSessionReturn {
   disconnect: () => void
   sendAudio: (pcm16: ArrayBuffer) => void
   sendVideo: (jpegBase64: string) => void
+  sendText: (text: string) => void
   isAiSpeaking: boolean
+  warmUpAudio: () => Promise<void>
 }
 
-/** ArrayBuffer → base64 string (browser-compatible) */
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer)
-  let binary = ""
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
-  return btoa(binary)
-}
+/** ArrayBuffer → base64 (thin wrapper around the canonical util) */
+const arrayBufferToBase64 = (buf: ArrayBuffer) => uint8ToBase64(new Uint8Array(buf))
 
 export function useGeminiLiveSession({
   interviewId,
@@ -47,11 +59,16 @@ export function useGeminiLiveSession({
   const [isAiSpeaking, setIsAiSpeaking] = useState(false)
 
   const wsRef = useRef<WebSocket | null>(null)
-  const playerRef = useRef<GeminiAudioPlayer | null>(null)
+  // Player created once on mount so warmUpAudio() can be called before connect()
+  const playerRef = useRef<GeminiAudioPlayer>(new GeminiAudioPlayer())
   const isConnectingRef = useRef(false)
   const userClosedRef = useRef(false)
   const wasActiveRef = useRef(false)
   const abortControllerRef = useRef<AbortController | null>(null)
+  // Tracks whether AI has spoken at least once this session (for fallback trigger)
+  const aiHasSpokenRef = useRef(false)
+  // Timer for fallback silence trigger if AI doesn't respond to audioStreamEnd
+  const firstResponseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Stable callback refs
   const onTranscriptRef = useRef(onTranscript)
@@ -65,18 +82,26 @@ export function useGeminiLiveSession({
   useEffect(() => { onErrorRef.current = onError }, [onError])
   useEffect(() => { onSessionEndRef.current = onSessionEnd }, [onSessionEnd])
 
+  const clearFirstResponseTimer = useCallback(() => {
+    if (firstResponseTimerRef.current) {
+      clearTimeout(firstResponseTimerRef.current)
+      firstResponseTimerRef.current = null
+    }
+  }, [])
+
   const disconnect = useCallback(() => {
     userClosedRef.current = true
+    clearFirstResponseTimer()
     abortControllerRef.current?.abort()
     wsRef.current?.close()
     wsRef.current = null
-    playerRef.current?.close()
-    playerRef.current = null
+    playerRef.current.clear()
     isConnectingRef.current = false
     wasActiveRef.current = false
+    aiHasSpokenRef.current = false
     setStatus("closed")
     setIsAiSpeaking(false)
-  }, [])
+  }, [clearFirstResponseTimer])
 
   const connect = useCallback(async () => {
     if (isConnectingRef.current || wsRef.current?.readyState === WebSocket.OPEN) return
@@ -86,6 +111,7 @@ export function useGeminiLiveSession({
     try {
       userClosedRef.current = false
       wasActiveRef.current = false
+      aiHasSpokenRef.current = false
       abortControllerRef.current = new AbortController()
 
       // Fetch ephemeral token from backend
@@ -96,10 +122,14 @@ export function useGeminiLiveSession({
       if (!res.ok) throw new Error(`Token fetch failed: ${res.status}`)
       const { token, wsUri, isEphemeral } = await res.json()
 
-      // Setup audio player
-      const player = new GeminiAudioPlayer()
-      playerRef.current = player
-      player.onPlayStart = () => { setIsAiSpeaking(true); onAiSpeakStartRef.current() }
+      // Wire up audio player callbacks (player created once on mount)
+      const player = playerRef.current
+      player.onPlayStart = () => {
+        aiHasSpokenRef.current = true
+        clearFirstResponseTimer() // AI responded — cancel fallback timer
+        setIsAiSpeaking(true)
+        onAiSpeakStartRef.current()
+      }
       player.onPlayEnd = () => { setIsAiSpeaking(false); onAiSpeakEndRef.current() }
 
       // Ephemeral tokens use ?access_token=; API keys use ?key=
@@ -108,7 +138,6 @@ export function useGeminiLiveSession({
       wsRef.current = ws
 
       ws.onopen = () => {
-        // Send BidiGenerateContentSetup — minimal first, features added after setupComplete
         const setupMsg = {
           setup: {
             model: GEMINI_LIVE_MODEL,
@@ -122,26 +151,37 @@ export function useGeminiLiveSession({
           },
         }
         console.log("[gemini-ws] setup:", JSON.stringify(setupMsg).slice(0, 300))
-        console.log("[gemini-ws] wsUrl:", wsUrl.replace(/[?].+/, "?***"))
         ws.send(JSON.stringify(setupMsg))
       }
 
       const handleMessage = async (event: MessageEvent) => {
-        // Gemini Live API sends binary Blob frames — must convert to text before parsing
         const raw: string = event.data instanceof Blob
           ? await event.data.text()
           : event.data as string
         try {
           const msg = JSON.parse(raw)
-          console.log("[gemini-ws] msg keys:", Object.keys(msg).join(","))
 
-          // Session ready — mic audio from media capture will flow in automatically.
-          // Native audio models (gemini-*-live-*) use VAD: they respond when real speech arrives.
-          // clientContent text turns are unsupported by this model family and cause a 1007 close.
           if ("setupComplete" in msg) {
             setStatus("active")
             wasActiveRef.current = true
             isConnectingRef.current = false
+
+            // Signal end-of-turn so Gemini knows to produce its greeting.
+            // Native audio models (gemini-*-live-*) use VAD; audioStreamEnd explicitly
+            // marks "user turn done" without requiring the user to actually speak first.
+            ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: {} } }))
+
+            // Fallback: if AI doesn't respond within 5s, nudge VAD with 32ms of silence.
+            firstResponseTimerRef.current = setTimeout(() => {
+              if (wsRef.current?.readyState === WebSocket.OPEN && !aiHasSpokenRef.current) {
+                console.debug("[gemini-ws] fallback silence trigger fired")
+                wsRef.current.send(JSON.stringify({
+                  realtimeInput: {
+                    audio: { mimeType: "audio/pcm;rate=16000", data: arrayBufferToBase64(SILENCE_FALLBACK_PCM.buffer) },
+                  },
+                }))
+              }
+            }, 5000)
             return
           }
 
@@ -153,7 +193,7 @@ export function useGeminiLiveSession({
             }
           }
 
-          // Transcription fields are top-level in server messages (not under serverContent)
+          // Transcription fields are at message top level (not under serverContent)
           if (msg.outputTranscription?.text) {
             onTranscriptRef.current(msg.outputTranscription.text, "ai")
           }
@@ -161,11 +201,6 @@ export function useGeminiLiveSession({
             onTranscriptRef.current(msg.inputTranscription.text, "candidate")
           }
 
-          if (msg.serverContent?.turnComplete) {
-            // AI finished speaking this turn — player.onPlayEnd fires after queue drains
-          }
-
-          // Catch Gemini error responses (e.g. invalid model, quota exceeded)
           if (msg.error) {
             const errMsg = msg.error.message || JSON.stringify(msg.error)
             onErrorRef.current(`Gemini: ${errMsg}`)
@@ -179,34 +214,39 @@ export function useGeminiLiveSession({
       ws.onmessage = handleMessage
 
       ws.onerror = () => {
-        onErrorRef.current("WebSocket connection error")
+        onErrorRef.current("Lỗi kết nối WebSocket")
         setStatus("error")
         isConnectingRef.current = false
       }
 
       ws.onclose = (e) => {
         console.log("[gemini-ws] closed:", e.code, e.reason, "wasClean:", e.wasClean, "wasActive:", wasActiveRef.current)
+        clearFirstResponseTimer()
         setStatus("closed")
         isConnectingRef.current = false
-        playerRef.current?.close()
+        playerRef.current.clear()
         if (!userClosedRef.current) {
-          if (!e.wasClean) {
-            onErrorRef.current(`Connection closed unexpectedly (${e.code})`)
-          } else if (!wasActiveRef.current) {
-            onErrorRef.current(`Phiên kết nối thất bại (${e.code}${e.reason ? `: ${e.reason}` : ""})`)
+          if (!e.wasClean || e.code !== 1000) {
+            const label = WS_CLOSE_REASONS[e.code] ?? `Kết nối đóng bất thường (mã ${e.code})`
+            const detail = e.reason ? `: ${e.reason}` : ""
+            if (!wasActiveRef.current) {
+              onErrorRef.current(`Phiên kết nối thất bại — ${label}${detail}`)
+            } else {
+              onErrorRef.current(`${label}${detail}`)
+            }
           }
         }
         if (!userClosedRef.current && wasActiveRef.current) onSessionEndRef.current()
       }
     } catch (e) {
-      if (e instanceof Error && e.name === "AbortError") return // user disconnected
-      const msg = e instanceof Error ? e.message : "Connection failed"
+      if (e instanceof Error && e.name === "AbortError") return
+      const msg = e instanceof Error ? e.message : "Kết nối thất bại"
       onErrorRef.current(msg)
       setStatus("error")
       isConnectingRef.current = false
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps — status removed: refs used for guards instead
-  }, [interviewId, systemInstruction])
+  // eslint-disable-next-line react-hooks/exhaustive-deps — refs used for guards; status excluded intentionally
+  }, [interviewId, systemInstruction, clearFirstResponseTimer])
 
   const sendAudio = useCallback((pcm16: ArrayBuffer) => {
     const ws = wsRef.current
@@ -230,7 +270,24 @@ export function useGeminiLiveSession({
     }))
   }, [])
 
-  useEffect(() => () => { disconnect() }, [disconnect])
+  /** Send a text message mid-session (uses realtimeInput.text — NOT clientContent).
+   *  Gemini Live API realtimeInput.text accepts a plain string, not {text}. */
+  const sendText = useCallback((text: string) => {
+    const ws = wsRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    ws.send(JSON.stringify({
+      realtimeInput: { text },
+    }))
+  }, [])
 
-  return { status, connect, disconnect, sendAudio, sendVideo, isAiSpeaking }
+  useEffect(() => () => {
+    clearFirstResponseTimer()
+    disconnect() // disconnect() already calls player.clear()
+  }, [disconnect, clearFirstResponseTimer])
+
+  const warmUpAudio = useCallback(async () => {
+    await playerRef.current.warmUp()
+  }, [])
+
+  return { status, connect, disconnect, sendAudio, sendVideo, sendText, isAiSpeaking, warmUpAudio }
 }

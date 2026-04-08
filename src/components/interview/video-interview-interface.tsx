@@ -1,7 +1,7 @@
 "use client"
 
 import { useState, useCallback, useRef, useEffect } from "react"
-import { Mic, MicOff, Video, VideoOff, PhoneOff } from "lucide-react"
+import { Mic, MicOff, Video, VideoOff, PhoneOff, RefreshCw } from "lucide-react"
 import { useMediaCapture } from "@/hooks/use-media-capture"
 import { useGeminiLiveSession } from "@/hooks/use-gemini-live-session"
 import { VideoAvatarPanel } from "./video-avatar-panel"
@@ -39,6 +39,7 @@ export function VideoInterviewInterface({
   const [isAiSpeaking, setIsAiSpeaking] = useState(false)
   const [sessionError, setSessionError] = useState<string | null>(null)
   const [isCameraOff, setIsCameraOff] = useState(false)
+  const [started, setStarted] = useState(false)
   const transcriptEndRef = useRef<HTMLDivElement | null>(null)
   const hasTranscriptsRef = useRef(false)
 
@@ -71,15 +72,33 @@ export function VideoInterviewInterface({
     onVideoFrame: session.sendVideo,
   })
 
-  const [started, setStarted] = useState(false)
-
   // Called from a button click — satisfies Chrome's AudioContext autoplay policy.
-  // AudioContext created inside getUserMedia / AudioWorklet setup MUST be triggered
-  // by a user gesture, otherwise it stays suspended and captures/plays no audio.
   const handleStart = useCallback(async () => {
     setStarted(true)
-    await session.connect()
-    await media.start()
+    setSessionError(null)
+    try {
+      // warmUpAudio MUST be called inside the user-gesture window
+      await session.warmUpAudio()
+      await session.connect()
+      await media.start()
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Không thể khởi động phỏng vấn"
+      setSessionError(msg)
+      setStarted(false) // show pre-start screen again
+    }
+  }, [session, media])
+
+  const handleRetry = useCallback(async () => {
+    setSessionError(null)
+    setStarted(true)
+    try {
+      await session.connect()
+      if (media.status !== "active") await media.start()
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Kết nối lại thất bại"
+      setSessionError(msg)
+      setStarted(false)
+    }
   }, [session, media])
 
   // Cleanup on unmount
@@ -125,7 +144,8 @@ export function VideoInterviewInterface({
         </div>
         <button
           onClick={handleStart}
-          className="px-6 py-2.5 rounded-full bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors"
+          disabled={disabled}
+          className="px-6 py-2.5 rounded-full bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors disabled:opacity-50"
         >
           Bắt đầu phỏng vấn
         </button>
@@ -146,6 +166,27 @@ export function VideoInterviewInterface({
         <button onClick={onFallbackToText} className="text-sm text-primary underline hover:no-underline">
           Chuyển sang chế độ văn bản
         </button>
+      </div>
+    )
+  }
+
+  // ── Connection error with retry ───────────────────────────────────────
+  if ((session.status === "error" || session.status === "closed") && sessionError && !hasTranscriptsRef.current) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-4 p-8 text-center min-h-[300px]">
+        <p className="text-sm text-destructive max-w-xs">{sessionError}</p>
+        <div className="flex gap-3">
+          <button
+            onClick={handleRetry}
+            className="flex items-center gap-2 px-4 py-2 rounded-full bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            Thử lại
+          </button>
+          <button onClick={onFallbackToText} className="text-sm text-muted-foreground underline hover:no-underline">
+            Dùng chế độ văn bản
+          </button>
+        </div>
       </div>
     )
   }
@@ -200,7 +241,7 @@ export function VideoInterviewInterface({
             </button>
           </div>
 
-          {/* Connection status indicator */}
+          {/* Connection status dot */}
           <div className="absolute top-3 right-3">
             <span className={`w-2.5 h-2.5 rounded-full block ${
               session.status === "active" ? "bg-green-400 animate-pulse" :
@@ -220,15 +261,27 @@ export function VideoInterviewInterface({
 
       {/* ── Right column: live transcript sidebar ────────────────────── */}
       <div className="w-full lg:w-72 flex flex-col bg-white border border-gray-100 rounded-xl overflow-hidden">
-        <div className="px-4 py-2.5 border-b border-gray-100">
+        {/* Header with status badge */}
+        <div className="px-4 py-2.5 border-b border-gray-100 flex items-center justify-between">
           <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Transcript</p>
+          <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full ${
+            session.status === "active" ? "bg-green-50 text-green-600" :
+            session.status === "connecting" ? "bg-yellow-50 text-yellow-600" :
+            session.status === "error" ? "bg-red-50 text-red-600" :
+            "bg-gray-50 text-gray-500"
+          }`}>
+            {session.status === "active" ? "Đang phỏng vấn" :
+             session.status === "connecting" ? "Đang kết nối..." :
+             session.status === "error" ? "Lỗi" :
+             session.status === "closed" ? "Đã kết thúc" : ""}
+          </span>
         </div>
 
         <div className="flex-1 overflow-y-auto py-2 space-y-1 min-h-0">
           {transcripts.length === 0 ? (
             <p className="text-xs text-muted-foreground text-center py-6 px-4">
               {session.status === "connecting" ? "Đang kết nối..." :
-               session.status === "active" ? "Nói để bắt đầu phỏng vấn — AI sẽ chào bạn" :
+               session.status === "active" ? "Nói để bắt đầu — AI sẽ chào bạn" :
                "Cuộc trò chuyện chưa bắt đầu"}
             </p>
           ) : (
@@ -239,9 +292,17 @@ export function VideoInterviewInterface({
           <div ref={transcriptEndRef} />
         </div>
 
-        {sessionError && (
-          <div className="px-3 py-2 bg-red-50 border-t border-red-100 shrink-0">
-            <p className="text-xs text-red-600">{sessionError}</p>
+        {/* Non-fatal error banner (has transcripts = interview started, just degraded) */}
+        {sessionError && hasTranscriptsRef.current && (
+          <div className="px-3 py-2 bg-red-50 border-t border-red-100 shrink-0 flex items-center justify-between gap-2">
+            <p className="text-xs text-red-600 flex-1">{sessionError}</p>
+            <button
+              onClick={handleRetry}
+              title="Thử kết nối lại"
+              className="shrink-0 text-red-500 hover:text-red-700"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+            </button>
           </div>
         )}
       </div>
