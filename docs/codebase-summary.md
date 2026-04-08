@@ -1,7 +1,7 @@
 # HR Interview System — Codebase Summary
 
-**Phase:** phase-05-integration-state  
-**Last Updated:** April 8, 2026
+**Phase:** phase-05-integration-state (greeting-opener-fix)  
+**Last Updated:** April 8, 2026 (greeting & voice session UX improvements)
 
 ## Overview
 
@@ -15,18 +15,36 @@ AI-powered recruitment system automating interview workflows: job analysis → c
 ├─────────────────────────────────────────────────────────┤
 │ API: Next.js Routes                                     │
 │   - /api/interviews/[id]/live-token (WebSocket token)  │
-│   - Other interview endpoints                           │
+│   - /api/interviews/[id]/chat (AI chat)                │
+│   - /api/interviews/[id]/report (report generation)    │
+│   - /api/interviews/[id]/save-live-results (results)   │
+│   - /api/interviews/[id]/start (interview init)        │
 ├─────────────────────────────────────────────────────────┤
 │ Services: GeminiClient (SDK: @google/genai)            │
 │   - generateContent(), generateJSON(), generateEmbedding()
+├─────────────────────────────────────────────────────────┤
+│ Instrumentation: Error suppression (process.emit)      │
+│   - Suppress ECONNRESET / ABORT_ERR from client drops  │
 ├─────────────────────────────────────────────────────────┤
 │ Storage: Prisma ORM + Database                          │
 └─────────────────────────────────────────────────────────┘
 ```
 
+## Error Suppression (ECONNRESET Fix)
+
+**File:** `src/instrumentation.ts`
+
+- **Strategy:** Monkey-patch `process.emit()` at Next.js startup to intercept `uncaughtException` events.
+- **Suppressed errors:** `ECONNRESET`, `ABORT_ERR`, `ERR_STREAM_PREMATURE_CLOSE`, "aborted"
+- **Purpose:** Browser/client disconnections (TCP close mid-request) are harmless socket errors; suppress before Next.js listeners see them.
+- **Common triggers:** React StrictMode remount, tab close, navigation during fetch
+- **Logging:** Debug-level console.debug() for tracing
+- **Benefit:** Prevents false crash logs and improves signal-to-noise in error monitoring
+
 ## Implementations (Phase 05 Complete)
 
-**Interview State Management:** Zustand store extended with live session tracking.
+**Interview State Management:** Zustand store with abort control & live session tracking.
+- `_abortController`: Nulled after successful response to prevent re-entry abort (safe null check via `?.abort()`)
 - `interviewMode`: 'TEXT' | 'VOICE' | 'HYBRID'
 - `liveSessionStatus`: 'idle' | 'connecting' | 'active' | 'error' | 'closed'
 - `isAiSpeaking`, `mediaPermission` state fields
@@ -42,6 +60,20 @@ AI-powered recruitment system automating interview workflows: job analysis → c
 - Evaluates each answer using existing evaluation service
 - Persists results to DB: answerText, durationSeconds, AnswerEvaluation records
 - Returns evaluation payload for report generation
+
+## Greeting Opener & Voice Session Flow (Phase 05 Update)
+
+**Interview Initialization:** AI greeting + first question now combined into single message.
+- **Text Mode:** Greeting + Q1 sent immediately when `startInterview()` is called. Skips dedicated "greeting" step, interview state goes straight to "questioning". User input enabled right away.
+- **Voice Mode:** After WebSocket `setupComplete`, sends 1 second PCM silence packet (16kHz, 32000 bytes zeros) via RealtimeInput to trigger Gemini's first spoken response. Timeout: 8 seconds with retry. Timeout clears on disconnect or when AI starts speaking.
+
+**Files Modified:**
+1. `src/stores/interview-store.ts` — `startInterview()` combines greeting + Q1 into single AI message. `advanceFromGreeting()` kept but is dead code for text mode.
+2. `src/app/(dashboard)/interviews/[id]/page.tsx` — Removed `advanceFromGreeting()` call from `handleSpeakEnd`. TTS is now cosmetic only, not a progression gate.
+3. `src/hooks/use-gemini-live-session.ts` — Sends silence packet post-`setupComplete` to trigger Gemini's first response. Implements 8s timeout with retry logic.
+4. `src/components/interview/video-interview-interface.tsx` — Empty transcript state shows "Đang chờ AI phản hồi..." when session is active (improved UX).
+
+**Impact:** Both text and voice modes now deliver seamless greeting + first question experience, reducing perceived latency in voice interviews.
 
 ## Key Components
 
@@ -108,6 +140,8 @@ AI-powered recruitment system automating interview workflows: job analysis → c
   - Send audio/video frames as RealtimeInput messages
   - Receive AI audio → pass to GeminiAudioPlayer
   - Barge-in support (interrupt AI)
+  - **New:** Silence packet trigger (1s PCM silence @ 16kHz, 32000 bytes) post-`setupComplete` to initiate Gemini's first spoken response
+    - 8s retry timeout; clears on disconnect or when AI speaks
 - **Integration:** Works with `useMediaCapture` for media input
 
 ### 7. Video Interview Interface Component
@@ -133,6 +167,22 @@ AI-powered recruitment system automating interview workflows: job analysis → c
 
 ## Data Flow: AI Interview Session
 
+**Text Mode:**
+```
+1. Candidate initiates interview
+   ↓
+2. startInterview() generates greeting + Q1 (combined message)
+   ↓
+3. AI message appended to interview state
+   ↓
+4. Interview step → "questioning" (no dedicated "greeting" step)
+   ↓
+5. Chat input enabled; candidate responds
+   ↓
+6. Candidate answer → evaluation → next question
+```
+
+**Voice Mode:**
 ```
 1. Candidate initiates interview
    ↓
@@ -140,15 +190,19 @@ AI-powered recruitment system automating interview workflows: job analysis → c
    ↓
 3. Backend returns ephemeral token + WebSocket URI
    ↓
-4. Frontend loads audio-processor.js as AudioWorklet
+4. WebSocket connection + setupComplete
    ↓
-5. Mic capture via pcm-processor → Int16 PCM chunks
+5. Client sends 1s silence packet (16kHz, 32000 bytes) to trigger AI response
    ↓
-6. WebSocket stream to Gemini Live (gemini-2.5-flash-native-audio-preview)
+6. Gemini speaks greeting + Q1
    ↓
-7. Gemini evaluates answers in real-time
+7. Candidate answers via live audio stream
    ↓
-8. Results → Database via API
+8. Mic capture → Int16 PCM chunks → WebSocket to Gemini Live
+   ↓
+9. Gemini evaluates & continues questioning
+   ↓
+10. Results → Database via API
 ```
 
 ## Dependencies (phase-01-deps-token)

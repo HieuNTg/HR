@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from "next/server"
 import { GoogleGenAI } from "@google/genai"
 
-const GEMINI_LIVE_MODEL = "gemini-3.1-flash-live-preview"
-const GEMINI_WS_URI =
-  "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent"
+const GEMINI_WS_EPHEMERAL =
+  "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained"
+const GEMINI_WS_APIKEY =
+  "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
 /** POST /api/interviews/[id]/live-token
  *  Returns a short-lived token for direct browser→Gemini WebSocket connection.
@@ -36,18 +37,16 @@ export async function POST(
         config: {
           uses: 1,
           expireTime,
-          liveConnectConstraints: {
-            model: GEMINI_LIVE_MODEL,
-          },
         },
       })
 
       if (req.signal.aborted) return new Response(null, { status: 499 })
 
       if (tokenResult.name) {
+        console.log("[live-token] ephemeral token created, using v1alpha/Constrained")
         return NextResponse.json({
           token: tokenResult.name,
-          wsUri: GEMINI_WS_URI,
+          wsUri: GEMINI_WS_EPHEMERAL,
           expiresAt: expireTime,
           isEphemeral: true, // client must use ?access_token= (not ?key=)
         })
@@ -67,9 +66,10 @@ export async function POST(
     if (req.signal.aborted) return new Response(null, { status: 499 })
 
     // Dev-only fallback: return API key directly (browser uses it as ?key=)
+    console.log("[live-token] using API key fallback, v1beta/BidiGenerateContent")
     return NextResponse.json({
       token: apiKey,
-      wsUri: GEMINI_WS_URI,
+      wsUri: GEMINI_WS_APIKEY,
       expiresAt: null,
       isEphemeral: false,
     })

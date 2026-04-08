@@ -52,6 +52,8 @@ export function useGeminiLiveSession({
   const userClosedRef = useRef(false)
   const wasActiveRef = useRef(false)
   const abortControllerRef = useRef<AbortController | null>(null)
+  const triggerRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const initialTriggerPendingRef = useRef(false)
 
   // Stable callback refs
   const onTranscriptRef = useRef(onTranscript)
@@ -68,6 +70,7 @@ export function useGeminiLiveSession({
   const disconnect = useCallback(() => {
     userClosedRef.current = true
     abortControllerRef.current?.abort()
+    if (triggerRetryRef.current) { clearTimeout(triggerRetryRef.current); triggerRetryRef.current = null }
     wsRef.current?.close()
     wsRef.current = null
     playerRef.current?.close()
@@ -99,7 +102,11 @@ export function useGeminiLiveSession({
       // Setup audio player
       const player = new GeminiAudioPlayer()
       playerRef.current = player
-      player.onPlayStart = () => { setIsAiSpeaking(true); onAiSpeakStartRef.current() }
+      player.onPlayStart = () => {
+        // AI responded — clear retry timeout
+        if (triggerRetryRef.current) { clearTimeout(triggerRetryRef.current); triggerRetryRef.current = null }
+        setIsAiSpeaking(true); onAiSpeakStartRef.current()
+      }
       player.onPlayEnd = () => { setIsAiSpeaking(false); onAiSpeakEndRef.current() }
 
       // Ephemeral tokens use ?access_token=; API keys use ?key=
@@ -108,8 +115,8 @@ export function useGeminiLiveSession({
       wsRef.current = ws
 
       ws.onopen = () => {
-        // Send BidiGenerateContentSetup
-        ws.send(JSON.stringify({
+        // Send BidiGenerateContentSetup — minimal first, features added after setupComplete
+        const setupMsg = {
           setup: {
             model: GEMINI_LIVE_MODEL,
             generationConfig: {
@@ -117,21 +124,47 @@ export function useGeminiLiveSession({
               speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } } },
             },
             systemInstruction: { parts: [{ text: systemInstruction }] },
-            outputTranscription: {},
-            inputTranscription: {},
+            outputAudioTranscription: {},
+            inputAudioTranscription: {},
           },
-        }))
+        }
+        console.log("[gemini-ws] setup:", JSON.stringify(setupMsg).slice(0, 300))
+        console.log("[gemini-ws] wsUrl:", wsUrl.replace(/[?].+/, "?***"))
+        ws.send(JSON.stringify(setupMsg))
       }
 
       ws.onmessage = (event: MessageEvent) => {
         try {
           const msg = JSON.parse(event.data as string)
+          console.log("[gemini-ws] msg keys:", Object.keys(msg).join(","))
 
-          // Session ready
+          // Session ready — send text turn to trigger AI's opening greeting
           if ("setupComplete" in msg) {
             setStatus("active")
             wasActiveRef.current = true
             isConnectingRef.current = false
+
+            // Send clientContent text turn to trigger Gemini's first response per system instruction
+            initialTriggerPendingRef.current = true
+            ws.send(JSON.stringify({
+              clientContent: {
+                turns: [{ role: "user", parts: [{ text: "Xin chào, tôi đã sẵn sàng cho buổi phỏng vấn." }] }],
+                turnComplete: true,
+              },
+            }))
+
+            // Retry if AI hasn't responded within 8s
+            triggerRetryRef.current = setTimeout(() => {
+              if (ws.readyState === WebSocket.OPEN && !playerRef.current?.speaking) {
+                ws.send(JSON.stringify({
+                  clientContent: {
+                    turns: [{ role: "user", parts: [{ text: "Xin chào" }] }],
+                    turnComplete: true,
+                  },
+                }))
+              }
+            }, 8000)
+
             return
           }
 
@@ -143,17 +176,28 @@ export function useGeminiLiveSession({
             }
           }
 
-          // Use transcription fields for text (outputTranscription/inputTranscription)
-          // These are more reliable than parts[].text and avoid duplicates
-          if (msg.serverContent?.outputTranscription?.text) {
-            onTranscriptRef.current(msg.serverContent.outputTranscription.text, "ai")
+          // Transcription fields are top-level in server messages (not under serverContent)
+          if (msg.outputTranscription?.text) {
+            onTranscriptRef.current(msg.outputTranscription.text, "ai")
           }
-          if (msg.serverContent?.inputTranscription?.text) {
-            onTranscriptRef.current(msg.serverContent.inputTranscription.text, "candidate")
+          if (msg.inputTranscription?.text) {
+            // Skip echoed initial trigger — don't show as candidate message
+            if (initialTriggerPendingRef.current) {
+              initialTriggerPendingRef.current = false
+            } else {
+              onTranscriptRef.current(msg.inputTranscription.text, "candidate")
+            }
           }
 
           if (msg.serverContent?.turnComplete) {
             // AI finished speaking this turn — player.onPlayEnd fires after queue drains
+          }
+
+          // Catch Gemini error responses (e.g. invalid model, quota exceeded)
+          if (msg.error) {
+            const errMsg = msg.error.message || JSON.stringify(msg.error)
+            onErrorRef.current(`Gemini: ${errMsg}`)
+            ws.close()
           }
         } catch {
           // Non-JSON frame (binary audio) — ignore; audio arrives as base64 in JSON
@@ -167,11 +211,16 @@ export function useGeminiLiveSession({
       }
 
       ws.onclose = (e) => {
+        console.log("[gemini-ws] closed:", e.code, e.reason, "wasClean:", e.wasClean, "wasActive:", wasActiveRef.current)
         setStatus("closed")
         isConnectingRef.current = false
         playerRef.current?.close()
-        if (!e.wasClean && !userClosedRef.current) {
-          onErrorRef.current(`Connection closed unexpectedly (${e.code})`)
+        if (!userClosedRef.current) {
+          if (!e.wasClean) {
+            onErrorRef.current(`Connection closed unexpectedly (${e.code})`)
+          } else if (!wasActiveRef.current) {
+            onErrorRef.current(`Phiên kết nối thất bại (${e.code}${e.reason ? `: ${e.reason}` : ""})`)
+          }
         }
         if (!userClosedRef.current && wasActiveRef.current) onSessionEndRef.current()
       }

@@ -186,7 +186,9 @@ export function VideoInterviewInterface({
         <div className="flex-1 overflow-y-auto py-2 space-y-1 min-h-0">
           {transcripts.length === 0 ? (
             <p className="text-xs text-muted-foreground text-center py-6 px-4">
-              {session.status === "connecting" ? "Đang kết nối..." : "Cuộc trò chuyện chưa bắt đầu"}
+              {session.status === "connecting" ? "Đang kết nối..." :
+               session.status === "active" ? "Đang chờ AI phản hồi..." :
+               "Cuộc trò chuyện chưa bắt đầu"}
             </p>
           ) : (
             transcripts.map((t, i) => (

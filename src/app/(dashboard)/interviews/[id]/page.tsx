@@ -72,10 +72,7 @@ export default function InterviewSessionPage() {
     setSpeakText(null)
     setStreamingMsgId(null)
     setSpokenCharIndex(0)
-    if (store.step === "greeting") {
-      store.advanceFromGreeting()
-    }
-  }, [store])
+  }, [])
 
   const handleSpokenProgress = useCallback((charIndex: number) => {
     setSpokenCharIndex(charIndex)

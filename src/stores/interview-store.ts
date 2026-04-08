@@ -148,10 +148,16 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
       // Response fully consumed — clear controller so re-entry abort is a no-op
       set({ _abortController: null })
 
+      // Combine greeting + first question into single opening message
+      const firstQuestion = data.questions[0]
+      const combinedContent = firstQuestion
+        ? `${data.greeting}\n\n${firstQuestion.questionText}`
+        : data.greeting
+
       const greetingMsg: ChatMessage = {
         id: nextMessageId(),
         role: "ai",
-        content: data.greeting,
+        content: combinedContent,
         timestamp: new Date(),
       }
 
@@ -164,7 +170,7 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
         currentQuestionIndex: 0,
         results: [],
         messages: [greetingMsg],
-        step: "greeting",
+        step: firstQuestion ? "questioning" : "greeting",
         loading: false,
       })
     } catch (error) {
