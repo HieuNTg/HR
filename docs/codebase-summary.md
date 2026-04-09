@@ -1,7 +1,7 @@
 # HR Interview System — Codebase Summary
 
-**Phase:** phase-05-integration-state (greeting-opener-fix)  
-**Last Updated:** April 8, 2026 (greeting & voice session UX improvements)
+**Phase:** phase-06-video-interview-redo (audio-worklet refactor, utils modularization)  
+**Last Updated:** April 9, 2026 (Gemini Live audio turn tracking, WebSocket auto-reconnect, AudioContext suspend buffer)
 
 ## Overview
 
@@ -61,7 +61,59 @@ AI-powered recruitment system automating interview workflows: job analysis → c
 - Persists results to DB: answerText, durationSeconds, AnswerEvaluation records
 - Returns evaluation payload for report generation
 
-## Greeting Opener & Voice Session Flow (Phase 05 Update)
+## Phase 06 Audio Pipeline Refactor
+
+**Objective:** Modularize audio/video processing into reusable utilities; upgrade AudioWorklet processor.
+
+**Changes:**
+1. **AudioWorklet Processor** (`public/audio-worklet.js`):
+   - Replaced naive per-frame allocation with preallocated ring buffer (8192 samples)
+   - Linear interpolation downsampling (48kHz → 16kHz) avoids quality loss
+   - Emits 480-sample Float32 chunks (30ms); main thread does conversion
+   - Registered as 'mic-processor' (clearer naming)
+
+2. **Audio Utilities** (`src/lib/audio-utils.ts` — new):
+   - Extracted conversion functions from scattered hook code
+   - `float32ToInt16()`, `int16ToFloat32()` for PCM quantization
+   - `uint8ToBase64()`, `pcmToBase64()`, `base64ToPcm()` for WebSocket encoding
+   - Centralized to avoid duplication (used by `useMediaCapture`, `GeminiAudioPlayer`, `useGeminiLiveSession`)
+
+3. **Video Utilities** (`src/lib/video-utils.ts` — new):
+   - Extracted `captureFrame()` canvas logic from inline implementations
+   - Canvas reuse per dimensions; JPEG quality 0.85 default
+   - Returns raw base64 (Gemini Live format)
+
+4. **Media Capture Hook** (`src/hooks/use-media-capture.ts` — updated):
+   - Uses new 'mic-processor' AudioWorklet processor
+   - Imports `float32ToInt16` from audio-utils
+   - Imports `captureFrame` from video-utils
+   - Dropped `audioSampleRate` param (now implicit 16kHz from worklet)
+   - Callback signature: `onAudioChunk(pcm16: ArrayBuffer)`
+
+5. **Gemini Audio Player** (`src/lib/gemini-live-audio-player.ts` — updated):
+   - Replaced epoch-based stale detection with AbortController signal
+   - Uses `int16ToFloat32()` + `base64ToPcm()` from audio-utils
+   - Gapless scheduling via `Web Audio API` queue
+
+6. **Gemini Live Session** (`src/hooks/use-gemini-live-session.ts` — updated):
+   - Uses `uint8ToBase64()` for audio encoding
+   - Silence packet: 128ms @ 16kHz (2048 zeros) triggers AI response
+   - 5s fallback timeout post-`setupComplete`, clears when AI speaks
+   - `aiHasSpokenRef` tracking for first response trigger logic
+   - Audio turn tracking (`aiHasAudioThisTurnRef`) — detects silent AI turns, triggers reconnect on 3+ misses
+   - WebSocket auto-reconnect: exponential backoff (1s, 2s, 4s) via `attemptGeminiReconnect()`, max 3 attempts
+   - `buildSetupMsg()` extracted as DRY helper for setup/reconnect consistency
+   - Human-readable WS close codes (Vietnamese UI labels)
+   - `sendText()` via `realtimeInput.text`
+
+7. **Video Interview Interface** (`src/components/interview/video-interview-interface.tsx` — updated):
+   - Pre-start screen + "Bắt đầu phỏng vấn" button (user gesture requirement)
+   - Status badge: connecting/active/error states
+   - Error + retry UI with state reset on failure
+   - Session validation: `hasTranscriptsRef` prevents empty report generation
+   - `started` state reset on `handleStart()` failure
+
+## Greeting Opener & Voice Session Flow (Phase 05 Recap)
 
 **Interview Initialization:** AI greeting + first question now combined into single message.
 - **Text Mode:** Greeting + Q1 sent immediately when `startInterview()` is called. Skips dedicated "greeting" step, interview state goes straight to "questioning". User input enabled right away.
@@ -101,69 +153,117 @@ AI-powered recruitment system automating interview workflows: job analysis → c
 - **Token TTL:** 30 minutes
 - **Constraints:** Single-use (uses: 1)
 
-### 3. Audio Capture
-**File:** `public/audio-processor.js`
+### 3. Audio Worklet Processor
+**File:** `public/audio-worklet.js`
 
-- **Type:** AudioWorklet processor (pcm-processor)
-- **Functionality:** Real-time Float32 → Int16 PCM conversion
-- **Output:** Quantizes to ±32767 range, posts to main thread as Int16Array buffer
-- **Use:** Browser microphone capture for WebSocket streaming
+- **Type:** AudioWorklet processor (registered as 'mic-processor')
+- **Input:** Browser native audio (48kHz, 44kHz, or any rate via sampleRate global)
+- **Processing:** Ring buffer + linear interpolation downsampling to 16kHz
+- **Output:** 480-sample Float32 chunks (30ms at 16kHz), emitted to main thread via `postMessage()`
+- **Design:** Preallocated ring buffer (8192 samples) avoids per-frame GC pressure in audio thread
+- **Use:** Low-latency microphone capture for Gemini Live WebSocket streaming
 
-### 4. Media Capture Hook
+### 4. Audio/Video Utilities & WebSocket Reconnect
+**Files:** `src/lib/audio-utils.ts`, `src/lib/video-utils.ts`, `src/lib/ws-reconnect.ts`
+
+**Audio Utilities (`audio-utils.ts`):**
+- `float32ToInt16()` — converts Float32 [-1,1] to Int16 PCM ±32767 (IEEE standard)
+- `int16ToFloat32()` — reverses conversion for playback
+- `uint8ToBase64()` — encodes Uint8Array to base64 (chunked for large buffers)
+- `pcmToBase64()` — encodes Int16 PCM buffer to base64 for WebSocket transmission
+- `base64ToPcm()` — decodes base64 back to Int16 PCM
+
+**Video Utilities (`video-utils.ts`):**
+- `captureFrame()` — captures JPEG frame from video element via canvas
+- Canvas reuse: created once per (width, height) pair, recreated on size change
+- Defaults: 768×768 JPEG at 0.85 quality
+- Returns: raw base64 (without `data:` prefix) for Gemini Live API
+
+**WebSocket Reconnect Utility** (`ws-reconnect.ts` — new):
+- `attemptGeminiReconnect()` — Handles exponential backoff + token refresh for failed WebSocket sessions
+- Retry delays: 1s, 2s, 4s (configurable maxAttempts)
+- Fetches fresh ephemeral token on each attempt via `/api/interviews/[id]/live-token`
+- Builds new WebSocket + sends setup payload (extracted to support stateless reconnect logic)
+- Cancellation support: caller can abort retry loop via `isCancelled()` check
+- Extracted from hook to keep `use-gemini-live-session.ts` file size manageable
+
+### 5. Media Capture Hook
 **File:** `src/hooks/use-media-capture.ts`
 
-- **Hook:** `useMediaCapture` — unified camera+mic capture
+- **Hook:** `useMediaCapture` — unified camera+mic capture with audio-worklet integration
 - **Features:**
   - `getUserMedia()` for audio+video streams
-  - AudioWorklet PCM16 streaming at 16kHz
-  - Canvas JPEG capture at 1 FPS (768x768)
+  - AudioWorklet processor ('mic-processor') emits Float32 chunks
+  - `float32ToInt16` + `captureFrame` from utils for stream conversion
+  - Callbacks: `onAudioChunk(pcm16: ArrayBuffer)`, `onVideoFrame(jpegBase64: string)`
   - MediaRecorder for audio file saving
 - **Exports:** `UseMediaCaptureOptions`, `CaptureStatus`, `UseMediaCaptureReturn`, `useMediaCapture`
+- **Changed:** Dropped `audioSampleRate` param (now implicit 16kHz from audio-worklet)
 
-### 5. Gemini Audio Player
+### 6. Gemini Audio Player
 **File:** `src/lib/gemini-live-audio-player.ts`
 
-- **Class:** `GeminiAudioPlayer` — Web Audio API playback
+- **Class:** `GeminiAudioPlayer` — Web Audio API playback for Gemini Live responses
 - **Features:**
-  - PCM16 24kHz gapless playback via AudioContext
-  - Epoch-based barge-in detection
-  - Methods: `enqueue(buffer)`, `clear()`, `close()`
-  - Handles audio chunks streaming from Gemini Live
+  - Decodes base64 PCM16 chunks → Float32 using `base64ToPcm()` + `int16ToFloat32()` from audio-utils
+  - 24kHz gapless playback via Web Audio API with queue-based scheduling
+  - **Stale callback detection:** AbortController signals deprecated onended handlers after `clear()` call
+  - **AudioContext suspend buffer:** Buffers incoming chunks during suspend state (autoplay restrictions), replays on resume via `flushSuspendBuffer()`
+  - Methods: `enqueue(base64Pcm16)`, `clear()`, `close()`, `warmUp()`, `onPlayStart/End` callbacks
+  - Handles continuous audio chunks streaming from Gemini Live
 
-### 6. Gemini Live Session Hook
+### 7. Gemini Live Session Hook
 **File:** `src/hooks/use-gemini-live-session.ts`
 
-- **Hook:** `useGeminiLiveSession` — WebSocket-based Gemini Live session
+- **Hook:** `useGeminiLiveSession` — WebSocket-based Gemini Live session management
 - **Features:**
-  - WebSocket connection to Gemini Live API
-  - Ephemeral token fetch & auth
-  - Send audio/video frames as RealtimeInput messages
-  - Receive AI audio → pass to GeminiAudioPlayer
-  - Barge-in support (interrupt AI)
-  - **New:** Silence packet trigger (1s PCM silence @ 16kHz, 32000 bytes) post-`setupComplete` to initiate Gemini's first spoken response
-    - 8s retry timeout; clears on disconnect or when AI speaks
-- **Integration:** Works with `useMediaCapture` for media input
+  - WebSocket connection + ephemeral token fetch from `/api/interviews/[id]/live-token`
+  - Models supported: `gemini-3.1-flash-live-preview`
+  - Send audio/video/text via `RealtimeInput` messages
+  - Receive AI audio → decode + pass to GeminiAudioPlayer
+  - Barge-in support (interrupt AI with new audio)
+  - **First Response Trigger:** Sends 128ms PCM silence (2048 zeros @ 16kHz) post-`setupComplete` + 5s fallback timeout
+    - Clears timeout when AI starts speaking or session closes
+    - Uses `uint8ToBase64()` for base64 encoding
+  - **Audio Turn Tracking** (`aiHasAudioThisTurnRef`): Detects when AI turn completes with 0 audio bytes (missed response)
+    - Threshold: 3+ consecutive missed turns triggers automatic WebSocket reconnection
+    - Prevents UI hang on silent/incomplete Gemini responses
+  - **WebSocket Auto-Reconnect** (via `attemptGeminiReconnect()`):
+    - Exponential backoff delays: 1s, 2s, 4s
+    - Max 3 reconnection attempts per session
+    - Fetches fresh ephemeral token on each attempt
+    - Tracks `reconnectAttemptsRef` to enforce limit
+  - **Setup Message DRY:** `buildSetupMsg()` extracted helper for consistent setup payload on initial connect + reconnect
+  - **AI Speaking Detection:** `aiHasSpokenRef` tracks whether AI has emitted audio
+  - **WS Close Codes:** Human-readable Vietnamese labels for close events (1006/1007/1011 mapped to user messages)
+  - **Integration:** Pairs with `useMediaCapture` for bidirectional streams
+  - **Methods:** `connect()`, `disconnect()`, `sendAudio()`, `sendVideo()`, `sendText()`, `warmUpAudio()`
 
-### 7. Video Interview Interface Component
+### 8. Video Interview Interface Component
 **File:** `src/components/interview/video-interview-interface.tsx`
 
-- **Component:** `VideoInterviewInterface` — Main video interview UI
+- **Component:** `VideoInterviewInterface` — Main video interview UI with controls
 - **Features:**
   - Composes `useMediaCapture` + `useGeminiLiveSession` hooks
-  - Camera preview with video frame display
-  - AI avatar panel for interviewee responses
-  - Transcript sidebar showing interview conversation
-  - Mic/camera controls (toggle on/off)
-  - Permission denied fallback to text mode
-- **Replaces:** `chat-interface` for video/audio interviews
+  - Pre-start screen with "Bắt đầu phỏng vấn" button (satisfies Chrome AudioContext autoplay policy)
+  - Camera preview + video frame streaming
+  - AI avatar panel (`VideoAvatarPanel`) for interviewee responses
+  - Real-time transcript sidebar
+  - Mic/camera toggle controls with status badges
+  - Status indicator: connecting/active/error/closed states
+  - Error display + retry button on connection failure
+  - Session validation: `onSessionEnd()` only fires if interview has transcripts (prevents empty reports)
+  - `handleStart()`: warmUp audio, connect session, start media capture (error → `started = false`)
+  - `handleRetry()`: reconnect with existing/new media stream
+  - Permission denied fallback: `onFallbackToText()` callback to parent
 
-### 8. Video Avatar Panel Component
+### 9. Video Avatar Panel Component
 **File:** `src/components/interview/video-avatar-panel.tsx`
 
-- **Component:** `VideoAvatarPanel` — AI avatar display & lip-sync
-- **Updates:** Added `isAiSpeakingLive?: boolean` prop
-- **Purpose:** When true, bypasses TTS and drives avatar lip-sync directly from real Gemini Live audio signal
-- **Benefit:** Synchronized lip movement with native Gemini audio output (lower latency than post-synthesis TTS)
+- **Component:** `VideoAvatarPanel` — AI avatar display with real-time lip-sync
+- **Props:** `isAiSpeakingLive?: boolean` — when true, drives lip-sync from Gemini Live audio directly
+- **Purpose:** Synchronized avatar animation with native Gemini audio (lower latency than post-TTS synthesis)
+- **Behavior:** Bypasses TTS lip-sync when live audio is streaming
 
 ## Data Flow: AI Interview Session
 
