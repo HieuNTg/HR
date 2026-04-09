@@ -3,11 +3,15 @@
 import { useRef, useState, useCallback, useEffect } from "react"
 import { GeminiAudioPlayer } from "@/lib/gemini-live-audio-player"
 import { uint8ToBase64 } from "@/lib/audio-utils"
+import { attemptGeminiReconnect } from "@/lib/ws-reconnect"
 
 const GEMINI_LIVE_MODEL = "models/gemini-3.1-flash-live-preview"
 
-// 32ms of silence at 16kHz (512 samples) — used to trigger VAD on session start
-const SILENCE_FALLBACK_PCM = new Int16Array(512) // all zeros
+// 128ms of silence at 16kHz (2048 samples) — used to trigger VAD on session start
+const SILENCE_FALLBACK_PCM = new Int16Array(2048) // all zeros
+
+const MAX_RECONNECT_ATTEMPTS = 3
+const RECONNECTABLE_CODES = new Set([1006, 1011, 1012, 1013])
 
 /** Human-readable WebSocket close code labels (Vietnamese for production UI) */
 const WS_CLOSE_REASONS: Record<number, string> = {
@@ -69,6 +73,13 @@ export function useGeminiLiveSession({
   const aiHasSpokenRef = useRef(false)
   // Timer for fallback silence trigger if AI doesn't respond to audioStreamEnd
   const firstResponseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const secondResponseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Counter for empty AI turns (turnComplete with no audio/text)
+  const missedTurnCountRef = useRef(0)
+  const MAX_MISSED_TURNS = 3
+  // Track whether AI sent audio in the current turn (more precise than text-only check)
+  const aiHasAudioThisTurnRef = useRef(false)
+  const reconnectAttemptsRef = useRef(0)
   // Transcript accumulators — buffer partial chunks, emit one entry per turn
   const partialAiTranscriptRef = useRef("")
   const partialCandidateTranscriptRef = useRef("")
@@ -90,6 +101,10 @@ export function useGeminiLiveSession({
       clearTimeout(firstResponseTimerRef.current)
       firstResponseTimerRef.current = null
     }
+    if (secondResponseTimerRef.current) {
+      clearTimeout(secondResponseTimerRef.current)
+      secondResponseTimerRef.current = null
+    }
   }, [])
 
   const disconnect = useCallback(() => {
@@ -102,6 +117,9 @@ export function useGeminiLiveSession({
     isConnectingRef.current = false
     wasActiveRef.current = false
     aiHasSpokenRef.current = false
+    aiHasAudioThisTurnRef.current = false
+    missedTurnCountRef.current = 0
+    reconnectAttemptsRef.current = 0
     partialAiTranscriptRef.current = ""
     partialCandidateTranscriptRef.current = ""
     setStatus("closed")
@@ -119,6 +137,7 @@ export function useGeminiLiveSession({
       aiHasSpokenRef.current = false
       partialAiTranscriptRef.current = ""
       partialCandidateTranscriptRef.current = ""
+      missedTurnCountRef.current = 0
       abortControllerRef.current = new AbortController()
 
       // Fetch ephemeral token from backend
@@ -144,17 +163,19 @@ export function useGeminiLiveSession({
       const ws = new WebSocket(wsUrl)
       wsRef.current = ws
 
-      ws.onopen = () => {
-        const setupMsg = {
-          setup: {
-            model: GEMINI_LIVE_MODEL,
-            generationConfig: {
-              responseModalities: ["AUDIO"],
-              speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } } },
-            },
-            systemInstruction: { parts: [{ text: systemInstruction }] },
+      const buildSetupMsg = () => ({
+        setup: {
+          model: GEMINI_LIVE_MODEL,
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } } },
           },
-        }
+          systemInstruction: { parts: [{ text: systemInstruction }] },
+        },
+      })
+
+      ws.onopen = () => {
+        const setupMsg = buildSetupMsg()
         console.log("[gemini-ws] setup:", JSON.stringify(setupMsg).slice(0, 300))
         ws.send(JSON.stringify(setupMsg))
       }
@@ -177,18 +198,26 @@ export function useGeminiLiveSession({
               realtimeInput: { text: "Bắt đầu" },
             }))
 
-            // Fallback: if AI hasn't spoken after 5s, nudge again.
+            // Fallback 1: if AI hasn't spoken after 8s, nudge with silence audio.
             firstResponseTimerRef.current = setTimeout(() => {
               if (wsRef.current?.readyState === WebSocket.OPEN && !aiHasSpokenRef.current) {
-                console.debug("[gemini-ws] fallback silence trigger fired")
+                console.warn("[gemini-ws] fallback 1: sending silence + audioStreamEnd")
                 wsRef.current.send(JSON.stringify({
                   realtimeInput: {
                     audio: { data: arrayBufferToBase64(SILENCE_FALLBACK_PCM.buffer), mimeType: "audio/pcm;rate=16000" },
                   },
                 }))
                 wsRef.current.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }))
+
+                // Fallback 2: if still no response after 12 more seconds, report error.
+                secondResponseTimerRef.current = setTimeout(() => {
+                  if (!aiHasSpokenRef.current) {
+                    console.error("[gemini-ws] fallback 2: AI still not responding after 20s total")
+                    onErrorRef.current("AI không phản hồi. Vui lòng kiểm tra micro và thử lại.")
+                  }
+                }, 12000)
               }
-            }, 5000)
+            }, 8000)
             return
           }
 
@@ -196,6 +225,7 @@ export function useGeminiLiveSession({
           const parts = msg.serverContent?.modelTurn?.parts ?? []
           for (const part of parts) {
             if (part.inlineData?.mimeType?.startsWith("audio/pcm") && part.inlineData.data) {
+              aiHasAudioThisTurnRef.current = true
               player.enqueue(part.inlineData.data)
             }
             // Capture text parts as AI transcript (gemini-3.1-flash-live outputs text in parts)
@@ -218,16 +248,36 @@ export function useGeminiLiveSession({
               onTranscriptRef.current(partialCandidateTranscriptRef.current.trim(), "candidate")
               partialCandidateTranscriptRef.current = ""
             }
-            if (partialAiTranscriptRef.current.trim()) {
-              onTranscriptRef.current(partialAiTranscriptRef.current.trim(), "ai")
+            // Check both text AND audio to avoid false "empty turn" when audio-only response
+            const hasContent = partialAiTranscriptRef.current.trim() || aiHasAudioThisTurnRef.current
+            if (hasContent) {
+              if (partialAiTranscriptRef.current.trim()) {
+                onTranscriptRef.current(partialAiTranscriptRef.current.trim(), "ai")
+              }
               partialAiTranscriptRef.current = ""
+              aiHasAudioThisTurnRef.current = false
+              missedTurnCountRef.current = 0
+            } else {
+              // Empty AI turn — no audio AND no text (safety filter or miss)
+              aiHasAudioThisTurnRef.current = false
+              missedTurnCountRef.current++
+              console.warn(`[gemini-ws] empty AI turn #${missedTurnCountRef.current}/${MAX_MISSED_TURNS}`)
+              if (missedTurnCountRef.current <= MAX_MISSED_TURNS) {
+                wsRef.current?.send(JSON.stringify({
+                  realtimeInput: { text: "Xin hãy trả lời lại câu hỏi" },
+                }))
+              } else {
+                console.error("[gemini-ws] too many missed turns, notifying user")
+                onErrorRef.current("AI không thể phản hồi. Đang chuyển sang câu hỏi tiếp theo...")
+                missedTurnCountRef.current = 0
+              }
             }
           }
 
           if (msg.error) {
             const errMsg = msg.error.message || JSON.stringify(msg.error)
             onErrorRef.current(`Gemini: ${errMsg}`)
-            ws.close()
+            wsRef.current?.close()
           }
         } catch {
           // Non-JSON frame — ignore
@@ -242,13 +292,51 @@ export function useGeminiLiveSession({
         isConnectingRef.current = false
       }
 
-      ws.onclose = (e) => {
+      // Reconnect-capable onclose — assigned as a named const so reconnected sockets can reuse it
+      const onWsClose = async (e: CloseEvent) => {
         console.log("[gemini-ws] closed:", e.code, e.reason, "wasClean:", e.wasClean, "wasActive:", wasActiveRef.current)
         clearFirstResponseTimer()
-        setStatus("closed")
         isConnectingRef.current = false
-        // clear() not close() — preserve AudioContext for potential reconnect
         playerRef.current.clear()
+
+        // Attempt transparent reconnect for recoverable close codes
+        if (!userClosedRef.current && wasActiveRef.current && RECONNECTABLE_CODES.has(e.code)) {
+          setStatus("connecting")
+          const newWs = await attemptGeminiReconnect({
+            interviewId,
+            maxAttempts: MAX_RECONNECT_ATTEMPTS,
+            buildSetupMsg,
+            onAttemptStart: (attempt, delay) => {
+              console.warn(`[gemini-ws] reconnect ${attempt}/${MAX_RECONNECT_ATTEMPTS} in ${delay}ms`)
+            },
+            isCancelled: () => userClosedRef.current,
+          })
+
+          if (newWs) {
+            newWs.onmessage = handleMessage
+            newWs.onerror = () => { onErrorRef.current("Lỗi kết nối WebSocket"); setStatus("error") }
+            newWs.onclose = (ev) => { onWsClose(ev).catch(err => console.error("[gemini-ws] onclose error:", err)) }
+            wsRef.current = newWs
+            reconnectAttemptsRef.current = 0
+            aiHasSpokenRef.current = false
+            aiHasAudioThisTurnRef.current = false
+            missedTurnCountRef.current = 0
+            partialAiTranscriptRef.current = ""
+            partialCandidateTranscriptRef.current = ""
+            return
+          }
+
+          // All reconnect attempts exhausted
+          reconnectAttemptsRef.current = 0
+          setStatus("closed")
+          const label = WS_CLOSE_REASONS[e.code] ?? `Kết nối đóng bất thường (mã ${e.code})`
+          onErrorRef.current(`Không thể kết nối lại: ${label}`)
+          onSessionEndRef.current()
+          return
+        }
+
+        // Non-reconnectable close
+        setStatus("closed")
         if (!userClosedRef.current) {
           if (!e.wasClean || e.code !== 1000) {
             const label = WS_CLOSE_REASONS[e.code] ?? `Kết nối đóng bất thường (mã ${e.code})`
@@ -262,6 +350,7 @@ export function useGeminiLiveSession({
         }
         if (!userClosedRef.current && wasActiveRef.current) onSessionEndRef.current()
       }
+      ws.onclose = (e) => { onWsClose(e).catch(err => console.error("[gemini-ws] onclose error:", err)) }
     } catch (e) {
       if (e instanceof Error && e.name === "AbortError") return
       const msg = e instanceof Error ? e.message : "Kết nối thất bại"

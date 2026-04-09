@@ -20,6 +20,9 @@ export class GeminiAudioPlayer {
   private abortController = new AbortController()
   // Track live sources so clear() can stop them without closing the AudioContext
   private scheduledSources: AudioBufferSourceNode[] = []
+  // Buffer chunks received while AudioContext is suspended, replay on resume
+  private suspendBuffer: string[] = []
+  private skippedChunks = 0
 
   onPlayStart?: () => void
   onPlayEnd?: () => void
@@ -45,9 +48,17 @@ export class GeminiAudioPlayer {
   /** Enqueue and schedule a PCM16 audio chunk for gapless playback */
   enqueue(base64Pcm16: string): void {
     const ctx = this.ensureContext()
-    // warmUp() should have been called in a user-gesture context first.
-    // Resume here as a best-effort fallback (may be a no-op if already running).
-    if (ctx.state === "suspended") ctx.resume().catch(() => {})
+    // Buffer chunks while suspended — replay when context resumes
+    if (ctx.state === "suspended") {
+      this.suspendBuffer.push(base64Pcm16)
+      this.skippedChunks++
+      if (this.skippedChunks <= 3) {
+        console.warn(`[audio-player] AudioContext suspended, buffering chunk #${this.skippedChunks} (call warmUp() in user gesture)`)
+      }
+      ctx.resume().then(() => this.flushSuspendBuffer()).catch(() => {})
+      return
+    }
+    this.skippedChunks = 0
 
     const float32 = this.decodeChunk(base64Pcm16)
     if (float32.length === 0) return
@@ -91,6 +102,15 @@ export class GeminiAudioPlayer {
     }
   }
 
+  /** Replay buffered chunks after AudioContext resumes from suspended state */
+  private flushSuspendBuffer(): void {
+    if (!this.ctx || this.ctx.state !== "running") return
+    const buffered = this.suspendBuffer.splice(0)
+    for (const chunk of buffered) {
+      this.enqueue(chunk)
+    }
+  }
+
   /** Stop all playback immediately (barge-in / interrupt) */
   clear(): void {
     // Abort all pending onended callbacks
@@ -103,6 +123,8 @@ export class GeminiAudioPlayer {
       try { src.stop() } catch { /* already ended */ }
     }
     this.scheduledSources = []
+    this.suspendBuffer = []
+    this.skippedChunks = 0
 
     this.nextPlayTime = 0
     this.pendingChunks = 0
