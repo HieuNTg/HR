@@ -6,7 +6,7 @@ import { uint8ToBase64 } from "@/lib/audio-utils"
 
 const GEMINI_LIVE_MODEL = "models/gemini-3.1-flash-live-preview"
 
-// 32ms of silence at 16kHz = 512 samples × 2 bytes = 1024 bytes
+// 32ms of silence at 16kHz (512 samples) — used to trigger VAD on session start
 const SILENCE_FALLBACK_PCM = new Int16Array(512) // all zeros
 
 /** Human-readable WebSocket close code labels (Vietnamese for production UI) */
@@ -69,6 +69,9 @@ export function useGeminiLiveSession({
   const aiHasSpokenRef = useRef(false)
   // Timer for fallback silence trigger if AI doesn't respond to audioStreamEnd
   const firstResponseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Transcript accumulators — buffer partial chunks, emit one entry per turn
+  const partialAiTranscriptRef = useRef("")
+  const partialCandidateTranscriptRef = useRef("")
 
   // Stable callback refs
   const onTranscriptRef = useRef(onTranscript)
@@ -95,10 +98,12 @@ export function useGeminiLiveSession({
     abortControllerRef.current?.abort()
     wsRef.current?.close()
     wsRef.current = null
-    playerRef.current.clear()
+    playerRef.current.close()
     isConnectingRef.current = false
     wasActiveRef.current = false
     aiHasSpokenRef.current = false
+    partialAiTranscriptRef.current = ""
+    partialCandidateTranscriptRef.current = ""
     setStatus("closed")
     setIsAiSpeaking(false)
   }, [clearFirstResponseTimer])
@@ -112,6 +117,8 @@ export function useGeminiLiveSession({
       userClosedRef.current = false
       wasActiveRef.current = false
       aiHasSpokenRef.current = false
+      partialAiTranscriptRef.current = ""
+      partialCandidateTranscriptRef.current = ""
       abortControllerRef.current = new AbortController()
 
       // Fetch ephemeral token from backend
@@ -146,8 +153,6 @@ export function useGeminiLiveSession({
               speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } } },
             },
             systemInstruction: { parts: [{ text: systemInstruction }] },
-            outputAudioTranscription: {},
-            inputAudioTranscription: {},
           },
         }
         console.log("[gemini-ws] setup:", JSON.stringify(setupMsg).slice(0, 300))
@@ -160,45 +165,63 @@ export function useGeminiLiveSession({
           : event.data as string
         try {
           const msg = JSON.parse(raw)
-
+          // Debug: log all top-level keys so we can diagnose message structure
+          console.debug("[gemini-ws] msg:", Object.keys(msg).join(","), JSON.stringify(msg).slice(0, 200))
           if ("setupComplete" in msg) {
             setStatus("active")
             wasActiveRef.current = true
             isConnectingRef.current = false
 
-            // Signal end-of-turn so Gemini knows to produce its greeting.
-            // Native audio models (gemini-*-live-*) use VAD; audioStreamEnd explicitly
-            // marks "user turn done" without requiring the user to actually speak first.
-            ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: {} } }))
+            // Trigger AI greeting via realtimeInput.text (clientContent causes 1007 on this model).
+            ws.send(JSON.stringify({
+              realtimeInput: { text: "Bắt đầu" },
+            }))
 
-            // Fallback: if AI doesn't respond within 5s, nudge VAD with 32ms of silence.
+            // Fallback: if AI hasn't spoken after 5s, nudge again.
             firstResponseTimerRef.current = setTimeout(() => {
               if (wsRef.current?.readyState === WebSocket.OPEN && !aiHasSpokenRef.current) {
                 console.debug("[gemini-ws] fallback silence trigger fired")
                 wsRef.current.send(JSON.stringify({
                   realtimeInput: {
-                    audio: { mimeType: "audio/pcm;rate=16000", data: arrayBufferToBase64(SILENCE_FALLBACK_PCM.buffer) },
+                    audio: { data: arrayBufferToBase64(SILENCE_FALLBACK_PCM.buffer), mimeType: "audio/pcm;rate=16000" },
                   },
                 }))
+                wsRef.current.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }))
               }
             }, 5000)
             return
           }
 
-          // Enqueue AI audio chunks for playback
+          // Enqueue AI audio chunks; also capture inline text parts as transcript fallback
           const parts = msg.serverContent?.modelTurn?.parts ?? []
           for (const part of parts) {
             if (part.inlineData?.mimeType?.startsWith("audio/pcm") && part.inlineData.data) {
               player.enqueue(part.inlineData.data)
             }
+            // Capture text parts as AI transcript (gemini-3.1-flash-live outputs text in parts)
+            if (part.text && !msg.outputTranscription) {
+              partialAiTranscriptRef.current += part.text
+            }
           }
 
-          // Transcription fields are at message top level (not under serverContent)
+          // Accumulate partial transcript chunks — Gemini streams tokens incrementally.
+          // Transcription fields arrive as TOP-LEVEL message keys (not under serverContent).
+          // Emit a single entry per turn (on turnComplete) instead of one bubble per chunk.
           if (msg.outputTranscription?.text) {
-            onTranscriptRef.current(msg.outputTranscription.text, "ai")
+            partialAiTranscriptRef.current += msg.outputTranscription.text
           }
           if (msg.inputTranscription?.text) {
-            onTranscriptRef.current(msg.inputTranscription.text, "candidate")
+            partialCandidateTranscriptRef.current += msg.inputTranscription.text
+          }
+          if (msg.serverContent?.turnComplete) {
+            if (partialCandidateTranscriptRef.current.trim()) {
+              onTranscriptRef.current(partialCandidateTranscriptRef.current.trim(), "candidate")
+              partialCandidateTranscriptRef.current = ""
+            }
+            if (partialAiTranscriptRef.current.trim()) {
+              onTranscriptRef.current(partialAiTranscriptRef.current.trim(), "ai")
+              partialAiTranscriptRef.current = ""
+            }
           }
 
           if (msg.error) {
@@ -224,6 +247,7 @@ export function useGeminiLiveSession({
         clearFirstResponseTimer()
         setStatus("closed")
         isConnectingRef.current = false
+        // clear() not close() — preserve AudioContext for potential reconnect
         playerRef.current.clear()
         if (!userClosedRef.current) {
           if (!e.wasClean || e.code !== 1000) {
@@ -255,7 +279,7 @@ export function useGeminiLiveSession({
     if (playerRef.current?.speaking) playerRef.current.clear()
     ws.send(JSON.stringify({
       realtimeInput: {
-        audio: { mimeType: "audio/pcm;rate=16000", data: arrayBufferToBase64(pcm16) },
+        audio: { data: arrayBufferToBase64(pcm16), mimeType: "audio/pcm;rate=16000" },
       },
     }))
   }, [])
@@ -265,19 +289,16 @@ export function useGeminiLiveSession({
     if (!ws || ws.readyState !== WebSocket.OPEN) return
     ws.send(JSON.stringify({
       realtimeInput: {
-        video: { mimeType: "image/jpeg", data: jpegBase64 },
+        video: { data: jpegBase64, mimeType: "image/jpeg" },
       },
     }))
   }, [])
 
-  /** Send a text message mid-session (uses realtimeInput.text — NOT clientContent).
-   *  Gemini Live API realtimeInput.text accepts a plain string, not {text}. */
+  /** Send a text message mid-session via realtimeInput.text. */
   const sendText = useCallback((text: string) => {
     const ws = wsRef.current
     if (!ws || ws.readyState !== WebSocket.OPEN) return
-    ws.send(JSON.stringify({
-      realtimeInput: { text },
-    }))
+    ws.send(JSON.stringify({ realtimeInput: { text } }))
   }, [])
 
   useEffect(() => () => {
@@ -291,3 +312,4 @@ export function useGeminiLiveSession({
 
   return { status, connect, disconnect, sendAudio, sendVideo, sendText, isAiSpeaking, warmUpAudio }
 }
+

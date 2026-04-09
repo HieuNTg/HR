@@ -92,6 +92,7 @@ export function VideoInterviewInterface({
     setSessionError(null)
     setStarted(true)
     try {
+      await session.warmUpAudio()
       await session.connect()
       if (media.status !== "active") await media.start()
     } catch (e) {

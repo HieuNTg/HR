@@ -6,6 +6,10 @@
 import { int16ToFloat32, base64ToPcm } from "@/lib/audio-utils"
 
 const GEMINI_OUTPUT_SAMPLE_RATE = 24000 // Gemini outputs 24kHz PCM16
+/** Lookahead added when a late chunk arrives (nextPlayTime already passed).
+ *  Gives the audio rendering thread enough lead time to schedule smoothly
+ *  instead of scheduling at currentTime which may already be past by render time. */
+const LOOKAHEAD_S = 0.05 // 50ms
 
 export class GeminiAudioPlayer {
   private ctx: AudioContext | null = null
@@ -14,6 +18,8 @@ export class GeminiAudioPlayer {
   private pendingChunks = 0
   // AbortController signals stale onended callbacks after clear() is called
   private abortController = new AbortController()
+  // Track live sources so clear() can stop them without closing the AudioContext
+  private scheduledSources: AudioBufferSourceNode[] = []
 
   onPlayStart?: () => void
   onPlayEnd?: () => void
@@ -53,12 +59,17 @@ export class GeminiAudioPlayer {
     source.buffer = buffer
     source.connect(ctx.destination)
 
-    // Schedule after previous chunk ends — gapless
-    const when = Math.max(ctx.currentTime, this.nextPlayTime)
+    // Schedule after previous chunk ends — gapless.
+    // If nextPlayTime has already passed (late chunk due to network jitter), add LOOKAHEAD_S
+    // so the audio rendering thread has time to process the scheduling command.
+    const when = this.nextPlayTime > ctx.currentTime
+      ? this.nextPlayTime
+      : ctx.currentTime + LOOKAHEAD_S
     source.start(when)
     this.nextPlayTime = when + buffer.duration
 
     this.pendingChunks++
+    this.scheduledSources.push(source)
     if (!this.isPlaying) {
       this.isPlaying = true
       this.onPlayStart?.()
@@ -68,6 +79,7 @@ export class GeminiAudioPlayer {
     // the signal will be aborted and onended becomes a no-op.
     const { signal } = this.abortController
     source.onended = () => {
+      this.scheduledSources = this.scheduledSources.filter(s => s !== source)
       if (signal.aborted) return
       this.pendingChunks--
       if (this.pendingChunks <= 0) {
@@ -85,13 +97,17 @@ export class GeminiAudioPlayer {
     this.abortController.abort()
     this.abortController = new AbortController()
 
+    // Stop each scheduled source individually — preserves the AudioContext so the
+    // warm-up resume() from the user gesture remains valid for future chunks.
+    for (const src of this.scheduledSources) {
+      try { src.stop() } catch { /* already ended */ }
+    }
+    this.scheduledSources = []
+
     this.nextPlayTime = 0
     this.pendingChunks = 0
     if (this.isPlaying) {
       this.isPlaying = false
-      // Recreate context to stop all in-flight sources cleanly
-      this.ctx?.close()
-      this.ctx = null
       this.onPlayEnd?.()
     }
   }
@@ -101,6 +117,8 @@ export class GeminiAudioPlayer {
   }
 
   close(): void {
-    this.clear() // clears context and fires onPlayEnd if needed
+    this.clear()
+    this.ctx?.close()
+    this.ctx = null
   }
 }
