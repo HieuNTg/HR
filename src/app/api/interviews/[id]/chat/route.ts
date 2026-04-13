@@ -1,11 +1,27 @@
 import { NextRequest, NextResponse } from "next/server"
 import { evaluateAnswer, generateAIResponse } from "@/lib/services/interview-ai-service"
+import type { AnswerEvaluation } from "@/lib/services/interview-ai-service"
 
 interface ChatRequestBody {
   message: string
   currentQuestion: string
   nextQuestion: string | null
   jobTitle: string
+}
+
+async function retryAsync<T>(
+  fn: () => Promise<T>,
+  maxRetries = 2,
+): Promise<T> {
+  let lastError: unknown
+  for (let i = 0; i <= maxRetries; i++) {
+    try { return await fn() }
+    catch (e) {
+      lastError = e
+      if (i < maxRetries) await new Promise(r => setTimeout(r, 1000 * 2 ** i))
+    }
+  }
+  throw lastError
 }
 
 export async function POST(req: NextRequest) {
@@ -17,15 +33,25 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Missing required fields" }, { status: 400 })
     }
 
-    // Evaluate the answer
-    const evaluation = await evaluateAnswer(currentQuestion, message, jobTitle)
+    // Evaluate with retry + graceful fallback
+    const evaluation: AnswerEvaluation = await retryAsync(
+      () => evaluateAnswer(currentQuestion, message, jobTitle),
+    ).catch(() => ({
+      score: 5,
+      feedback: "Không thể đánh giá tự động.",
+      strengths: [],
+      improvements: [],
+    }))
 
-    // Generate AI spoken response (feedback + transition to next question)
-    const aiResponse = await generateAIResponse(
-      currentQuestion,
-      message,
-      evaluation,
-      nextQuestion,
+    if (req.signal.aborted) return new Response(null, { status: 499 })
+
+    // Generate AI response with retry + graceful fallback
+    const aiResponse: string = await retryAsync(
+      () => generateAIResponse(currentQuestion, message, evaluation, nextQuestion),
+    ).catch(() =>
+      nextQuestion
+        ? "Cảm ơn bạn đã chia sẻ. Hãy chuyển sang câu hỏi tiếp theo."
+        : "Cảm ơn bạn đã tham gia buổi phỏng vấn. Kết quả sẽ được gửi qua email.",
     )
 
     if (req.signal.aborted) return new Response(null, { status: 499 })

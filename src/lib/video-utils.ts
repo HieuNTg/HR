@@ -11,9 +11,9 @@ let _canvasCtx: CanvasRenderingContext2D | null = null
 
 export function captureFrame(
   videoElement: HTMLVideoElement,
-  width = 768,
-  height = 768,
-  quality = 0.85,
+  width = 512,
+  height = 512,
+  quality = 0.6,
 ): string {
   // Reuse canvas if dimensions match; recreate on size change
   if (!_canvas || _canvas.width !== width || _canvas.height !== height) {

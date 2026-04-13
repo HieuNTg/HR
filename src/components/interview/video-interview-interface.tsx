@@ -1,18 +1,20 @@
 "use client"
 
-import { useState, useCallback, useRef, useEffect } from "react"
-import { Mic, MicOff, Video, VideoOff, PhoneOff, RefreshCw } from "lucide-react"
+import { useCallback, useRef, useEffect, useState } from "react"
+import {
+  Mic,
+  MicOff,
+  Video,
+  VideoOff,
+  PhoneOff,
+  RefreshCw,
+  MonitorSpeaker,
+  WifiOff,
+} from "lucide-react"
 import { useMediaCapture } from "@/hooks/use-media-capture"
 import { useGeminiLiveSession } from "@/hooks/use-gemini-live-session"
 import { VideoAvatarPanel } from "./video-avatar-panel"
-import { ChatMessageBubble } from "./chat-message-bubble"
 import type { GeneratedQuestion } from "@/lib/services/interview-ai-service"
-
-interface TranscriptEntry {
-  role: "ai" | "candidate"
-  text: string
-  timestamp: Date
-}
 
 export interface VideoInterviewInterfaceProps {
   interviewId: string
@@ -21,8 +23,7 @@ export interface VideoInterviewInterfaceProps {
   candidateName: string
   jobTitle: string
   onTranscript: (text: string, role: "ai" | "candidate") => void
-  onSessionEnd: () => void
-  /** Called when camera/mic permission denied — parent should switch to text mode */
+  onSessionEnd: (audio: Blob | null) => void
   onFallbackToText: () => void
   disabled: boolean
 }
@@ -30,32 +31,40 @@ export interface VideoInterviewInterfaceProps {
 export function VideoInterviewInterface({
   interviewId,
   systemInstruction,
+  candidateName,
+  jobTitle,
   onTranscript,
   onSessionEnd,
   onFallbackToText,
   disabled,
 }: VideoInterviewInterfaceProps) {
-  const [transcripts, setTranscripts] = useState<TranscriptEntry[]>([])
   const [isAiSpeaking, setIsAiSpeaking] = useState(false)
   const [sessionError, setSessionError] = useState<string | null>(null)
   const [isCameraOff, setIsCameraOff] = useState(false)
   const [started, setStarted] = useState(false)
-  const transcriptEndRef = useRef<HTMLDivElement | null>(null)
   const hasTranscriptsRef = useRef(false)
+  const [elapsed, setElapsed] = useState(0)
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  const handleTranscript = useCallback((text: string, role: "ai" | "candidate") => {
-    hasTranscriptsRef.current = true
-    setTranscripts((prev) => [...prev, { role, text, timestamp: new Date() }])
-    onTranscript(text, role)
-  }, [onTranscript])
+  const handleTranscript = useCallback(
+    (text: string, role: "ai" | "candidate") => {
+      hasTranscriptsRef.current = true
+      onTranscript(text, role)
+    },
+    [onTranscript],
+  )
 
-  // Only trigger onSessionEnd if the interview actually started (has transcripts).
-  // Prevents generating empty reports when the connection drops before anyone speaks.
-  const handleSessionEnd = useCallback(() => {
-    if (hasTranscriptsRef.current) {
-      onSessionEnd()
-    }
-  }, [onSessionEnd])
+  // Ref to the live-session stream accessor — set after session is created.
+  // Media capture uses this to mix AI audio into the saved recording.
+  const getAiStreamRef = useRef<(() => MediaStream | null) | null>(null)
+
+  const handleSessionEnd = useCallback(
+    async (audio?: Blob | null) => {
+      if (!hasTranscriptsRef.current) return
+      onSessionEnd(audio ?? null)
+    },
+    [onSessionEnd],
+  )
 
   const session = useGeminiLiveSession({
     interviewId,
@@ -64,27 +73,32 @@ export function VideoInterviewInterface({
     onAiSpeakStart: () => setIsAiSpeaking(true),
     onAiSpeakEnd: () => setIsAiSpeaking(false),
     onError: setSessionError,
-    onSessionEnd: handleSessionEnd,
+    // WS-close path — no audio to flush (user didn't press End Call).
+    // handleEndCall handles the happy path with a flushed recording.
+    onSessionEnd: () => { handleSessionEnd(null) },
   })
+
+  // Keep the stream accessor current (stable callback identity from the hook).
+  getAiStreamRef.current = session.getAiAudioStream
 
   const media = useMediaCapture({
     onAudioChunk: session.sendAudio,
     onVideoFrame: session.sendVideo,
+    getExtraAudioStream: () => getAiStreamRef.current?.() ?? null,
   })
 
-  // Called from a button click — satisfies Chrome's AudioContext autoplay policy.
   const handleStart = useCallback(async () => {
     setStarted(true)
     setSessionError(null)
     try {
-      // warmUpAudio MUST be called inside the user-gesture window
       await session.warmUpAudio()
       await session.connect()
       await media.start()
+      timerRef.current = setInterval(() => setElapsed((e) => e + 1), 1000)
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Không thể khởi động phỏng vấn"
       setSessionError(msg)
-      setStarted(false) // show pre-start screen again
+      setStarted(false)
     }
   }, [session, media])
 
@@ -102,19 +116,14 @@ export function VideoInterviewInterface({
     }
   }, [session, media])
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => {
       session.disconnect()
       media.stop()
+      if (timerRef.current) clearInterval(timerRef.current)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps — intentional cleanup-only
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
-
-  // Auto-scroll transcript to latest message
-  useEffect(() => {
-    transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" })
-  }, [transcripts])
 
   const toggleCamera = useCallback(() => {
     const srcObject = media.videoRef.current?.srcObject
@@ -125,188 +134,289 @@ export function VideoInterviewInterface({
     setIsCameraOff(!track.enabled)
   }, [media.videoRef])
 
-  const handleEndCall = useCallback(() => {
+  const handleEndCall = useCallback(async () => {
+    if (timerRef.current) clearInterval(timerRef.current)
+    // Flush recorder BEFORE disconnecting so AI's last audio makes it into the blob.
+    const audio = await media.stopRecordingAndGetAudio()
     session.disconnect()
-    handleSessionEnd()
-  }, [session, handleSessionEnd])
+    handleSessionEnd(audio)
+  }, [session, media, handleSessionEnd])
 
-  // ── Pre-start screen — must click to satisfy Chrome AudioContext autoplay policy ──
+  const formatTime = (s: number) => {
+    const m = Math.floor(s / 60)
+    const sec = s % 60
+    return `${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`
+  }
+
+  const statusColor =
+    session.status === "active"
+      ? "bg-emerald-500"
+      : session.status === "connecting"
+        ? "bg-amber-400"
+        : "bg-red-400"
+
+  const statusLabel =
+    session.status === "active"
+      ? "Đang phỏng vấn"
+      : session.status === "connecting"
+        ? "Đang kết nối..."
+        : session.status === "error"
+          ? "Lỗi kết nối"
+          : session.status === "closed"
+            ? "Đã kết thúc"
+            : ""
+
+  // ── Pre-start lobby ──────────────────────────────────────────────────
   if (!started) {
     return (
-      <div className="flex flex-col items-center justify-center gap-5 p-8 text-center min-h-[300px] h-full">
-        <div className="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center">
-          <Mic className="w-7 h-7 text-primary" />
+      <div className="flex items-center justify-center h-full bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 rounded-2xl overflow-hidden relative">
+        {/* Subtle grid pattern */}
+        <div
+          className="absolute inset-0 opacity-[0.03]"
+          style={{
+            backgroundImage: "radial-gradient(circle, rgba(255,255,255,0.8) 1px, transparent 1px)",
+            backgroundSize: "24px 24px",
+          }}
+        />
+
+        <div className="relative z-10 flex flex-col items-center gap-8 p-8 max-w-md">
+          {/* Logo + branding */}
+          <div className="flex items-center gap-3">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/novagroup-logo.webp" alt="NovaGroup" width={44} height={44} className="rounded-xl" />
+            <div>
+              <p className="text-white text-lg font-semibold tracking-tight">NovaGroup AI Interview</p>
+              <p className="text-slate-400 text-xs">Trợ lý tuyển dụng thông minh</p>
+            </div>
+          </div>
+
+          {/* Candidate info card */}
+          <div className="w-full bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl p-5 space-y-3">
+            <div className="flex items-center gap-3">
+              <div className="w-12 h-12 rounded-full bg-gradient-to-br from-emerald-400 to-teal-500 flex items-center justify-center text-white font-bold text-lg">
+                {candidateName?.charAt(0) || "?"}
+              </div>
+              <div>
+                <p className="text-white font-medium">{candidateName}</p>
+                <p className="text-slate-400 text-sm">{jobTitle}</p>
+              </div>
+            </div>
+
+            <div className="h-px bg-white/10" />
+
+            <div className="flex items-center gap-2 text-slate-300 text-sm">
+              <MonitorSpeaker className="w-4 h-4 text-slate-400" />
+              <span>Phỏng vấn video với AI — mic & camera sẽ được bật</span>
+            </div>
+          </div>
+
+          {/* Start button */}
+          <button
+            onClick={handleStart}
+            disabled={disabled}
+            className="group relative w-full py-3.5 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 text-white font-semibold text-sm
+              hover:from-emerald-400 hover:to-teal-400 transition-all duration-300
+              disabled:opacity-40 disabled:cursor-not-allowed
+              shadow-lg shadow-emerald-500/25 hover:shadow-emerald-500/40"
+          >
+            <span className="flex items-center justify-center gap-2">
+              <Video className="w-4.5 h-4.5" />
+              Bắt đầu phỏng vấn
+            </span>
+          </button>
+
+          {/* Fallback link */}
+          <button
+            onClick={onFallbackToText}
+            className="text-slate-500 text-xs hover:text-slate-300 transition-colors underline underline-offset-2"
+          >
+            Dùng chế độ văn bản thay thế
+          </button>
         </div>
-        <div className="space-y-1.5">
-          <p className="text-base font-semibold">Sẵn sàng bắt đầu phỏng vấn?</p>
-          <p className="text-sm text-muted-foreground max-w-xs">
-            Nhấn bắt đầu để kết nối mic, camera và AI phỏng vấn.
-          </p>
-        </div>
-        <button
-          onClick={handleStart}
-          disabled={disabled}
-          className="px-6 py-2.5 rounded-full bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors disabled:opacity-50"
-        >
-          Bắt đầu phỏng vấn
-        </button>
-        <button onClick={onFallbackToText} className="text-xs text-muted-foreground underline hover:no-underline">
-          Dùng chế độ văn bản thay thế
-        </button>
       </div>
     )
   }
 
-  // ── Permission denied fallback ────────────────────────────────────────
+  // ── Permission denied ────────────────────────────────────────────────
   if (media.status === "denied") {
     return (
-      <div className="flex flex-col items-center justify-center gap-4 p-8 text-center min-h-[300px]">
-        <p className="text-sm text-muted-foreground max-w-xs">
-          Quyền truy cập camera/mic bị từ chối. Vui lòng cấp quyền trong cài đặt trình duyệt hoặc chuyển sang chế độ văn bản.
-        </p>
-        <button onClick={onFallbackToText} className="text-sm text-primary underline hover:no-underline">
-          Chuyển sang chế độ văn bản
-        </button>
-      </div>
-    )
-  }
-
-  // ── Connection error with retry ───────────────────────────────────────
-  if ((session.status === "error" || session.status === "closed") && sessionError && !hasTranscriptsRef.current) {
-    return (
-      <div className="flex flex-col items-center justify-center gap-4 p-8 text-center min-h-[300px]">
-        <p className="text-sm text-destructive max-w-xs">{sessionError}</p>
-        <div className="flex gap-3">
+      <div className="flex items-center justify-center h-full bg-slate-900 rounded-2xl">
+        <div className="flex flex-col items-center gap-5 p-8 max-w-sm text-center">
+          <div className="w-14 h-14 rounded-full bg-red-500/10 flex items-center justify-center">
+            <VideoOff className="w-6 h-6 text-red-400" />
+          </div>
+          <div className="space-y-2">
+            <p className="text-white font-medium">Quyền truy cập bị từ chối</p>
+            <p className="text-slate-400 text-sm leading-relaxed">
+              Vui lòng cấp quyền camera/mic trong cài đặt trình duyệt hoặc chuyển sang chế độ văn bản.
+            </p>
+          </div>
           <button
-            onClick={handleRetry}
-            className="flex items-center gap-2 px-4 py-2 rounded-full bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors"
+            onClick={onFallbackToText}
+            className="px-5 py-2.5 rounded-xl bg-white/10 text-white text-sm font-medium hover:bg-white/15 transition-colors"
           >
-            <RefreshCw className="w-3.5 h-3.5" />
-            Thử lại
-          </button>
-          <button onClick={onFallbackToText} className="text-sm text-muted-foreground underline hover:no-underline">
-            Dùng chế độ văn bản
+            Chuyển sang chế độ văn bản
           </button>
         </div>
       </div>
     )
   }
 
+  // ── Connection error with retry ──────────────────────────────────────
+  if ((session.status === "error" || session.status === "closed") && sessionError && !hasTranscriptsRef.current) {
+    return (
+      <div className="flex items-center justify-center h-full bg-slate-900 rounded-2xl">
+        <div className="flex flex-col items-center gap-5 p-8 max-w-sm text-center">
+          <div className="w-14 h-14 rounded-full bg-red-500/10 flex items-center justify-center">
+            <WifiOff className="w-6 h-6 text-red-400" />
+          </div>
+          <div className="space-y-2">
+            <p className="text-white font-medium">Kết nối thất bại</p>
+            <p className="text-slate-400 text-sm">{sessionError}</p>
+          </div>
+          <div className="flex gap-3">
+            <button
+              onClick={handleRetry}
+              className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 text-white text-sm font-medium
+                hover:from-emerald-400 hover:to-teal-400 transition-all shadow-lg shadow-emerald-500/20"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              Thử lại
+            </button>
+            <button
+              onClick={onFallbackToText}
+              className="px-5 py-2.5 rounded-xl bg-white/10 text-white text-sm font-medium hover:bg-white/15 transition-colors"
+            >
+              Văn bản
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ── Active interview ─────────────────────────────────────────────────
   return (
-    <div className="flex flex-col lg:flex-row gap-3 h-full">
-      {/* ── Left column: camera preview + AI avatar ──────────────────── */}
-      <div className="flex-1 flex flex-col sm:flex-row lg:flex-col gap-3">
-
-        {/* Candidate camera preview */}
-        <div className="relative flex-1 bg-gray-900 rounded-xl overflow-hidden min-h-[180px]">
-          <video
-            ref={media.videoRef}
-            autoPlay
-            playsInline
-            muted
-            className={`w-full h-full object-cover transition-opacity ${isCameraOff ? "opacity-0" : "opacity-100"}`}
-            style={{ transform: "scaleX(-1)" }} // mirror for self-view
-          />
-          {isCameraOff && (
-            <div className="absolute inset-0 flex items-center justify-center bg-gray-800">
-              <VideoOff className="w-8 h-8 text-gray-500" />
+    <div className="flex h-full gap-0 bg-slate-900 rounded-2xl overflow-hidden relative">
+      {/* ── Main video area ─────────────────────────────────────────── */}
+      <div className="flex-1 flex flex-col min-w-0 relative">
+        {/* Top bar: status + timer */}
+        <div className="absolute top-0 left-0 right-0 z-20 flex items-center justify-between px-4 py-3">
+          <div className="flex items-center gap-2.5 bg-black/40 backdrop-blur-md rounded-full px-3 py-1.5">
+            <span className={`w-2 h-2 rounded-full ${statusColor} animate-pulse`} />
+            <span className="text-white/80 text-xs font-medium">{statusLabel}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="bg-black/40 backdrop-blur-md rounded-full px-3 py-1.5 flex items-center gap-2">
+              <div className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+              <span className="text-white/80 text-xs font-mono tabular-nums">{formatTime(elapsed)}</span>
             </div>
-          )}
+          </div>
+        </div>
 
-          {/* Controls bar */}
-          <div className="absolute bottom-3 left-0 right-0 flex items-center justify-center gap-2">
+        {/* Video grid: candidate + AI avatar */}
+        <div className="flex-1 flex flex-col sm:flex-row gap-2 p-2 min-h-0">
+          {/* Candidate camera */}
+          <div className="relative flex-[3] bg-slate-800 rounded-xl overflow-hidden min-h-[200px]">
+            <video
+              ref={media.videoRef}
+              autoPlay
+              playsInline
+              muted
+              className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-300 ${isCameraOff ? "opacity-0" : "opacity-100"}`}
+              style={{ transform: "scaleX(-1)" }}
+            />
+            {isCameraOff && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-slate-800">
+                <div className="w-16 h-16 rounded-full bg-slate-700 flex items-center justify-center text-white text-2xl font-semibold">
+                  {candidateName?.charAt(0) || "?"}
+                </div>
+                <p className="text-slate-400 text-sm">Camera đã tắt</p>
+              </div>
+            )}
+
+            {/* Name tag */}
+            <div className="absolute bottom-3 left-3 flex items-center gap-2">
+              <div className="bg-black/50 backdrop-blur-md rounded-lg px-2.5 py-1 flex items-center gap-1.5">
+                {media.isMuted ? (
+                  <MicOff className="w-3 h-3 text-red-400" />
+                ) : (
+                  <Mic className="w-3 h-3 text-white/70" />
+                )}
+                <span className="text-white text-xs font-medium">{candidateName || "Bạn"}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* AI Avatar */}
+          <div className="flex-1 min-h-[200px] sm:max-w-[280px]">
+            <VideoAvatarPanel
+              step="questioning"
+              speakText={null}
+              isAiSpeakingLive={isAiSpeaking}
+              variant="dark"
+            />
+          </div>
+        </div>
+
+        {/* ── Floating controls bar ─────────────────────────────────── */}
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20">
+          <div className="flex items-center gap-2 bg-slate-800/80 backdrop-blur-xl border border-white/10 rounded-2xl px-4 py-2.5 shadow-2xl shadow-black/40">
+            {/* Mic toggle */}
             <button
               onClick={media.toggleMute}
               title={media.isMuted ? "Bật mic" : "Tắt mic"}
-              className={`p-2 rounded-full backdrop-blur-sm transition-colors ${media.isMuted ? "bg-red-500 hover:bg-red-600" : "bg-white/20 hover:bg-white/30"}`}
+              className={`p-3 rounded-xl transition-all duration-200 cursor-pointer ${
+                media.isMuted
+                  ? "bg-red-500 hover:bg-red-600 text-white"
+                  : "bg-white/10 hover:bg-white/20 text-white"
+              }`}
             >
-              {media.isMuted
-                ? <MicOff className="w-4 h-4 text-white" />
-                : <Mic className="w-4 h-4 text-white" />}
+              {media.isMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
             </button>
+
+            {/* Camera toggle */}
             <button
               onClick={toggleCamera}
               title={isCameraOff ? "Bật camera" : "Tắt camera"}
-              className={`p-2 rounded-full backdrop-blur-sm transition-colors ${isCameraOff ? "bg-red-500 hover:bg-red-600" : "bg-white/20 hover:bg-white/30"}`}
+              className={`p-3 rounded-xl transition-all duration-200 cursor-pointer ${
+                isCameraOff
+                  ? "bg-red-500 hover:bg-red-600 text-white"
+                  : "bg-white/10 hover:bg-white/20 text-white"
+              }`}
             >
-              {isCameraOff
-                ? <VideoOff className="w-4 h-4 text-white" />
-                : <Video className="w-4 h-4 text-white" />}
+              {isCameraOff ? <VideoOff className="w-5 h-5" /> : <Video className="w-5 h-5" />}
             </button>
+
+            {/* Divider */}
+            <div className="w-px h-8 bg-white/10 mx-1" />
+
+            {/* End call */}
             <button
               onClick={handleEndCall}
               title="Kết thúc phỏng vấn"
-              className="p-2 rounded-full bg-red-500 hover:bg-red-600 backdrop-blur-sm"
+              className="px-5 py-3 rounded-xl bg-red-500 hover:bg-red-600 text-white transition-all duration-200 cursor-pointer flex items-center gap-2"
             >
-              <PhoneOff className="w-4 h-4 text-white" />
+              <PhoneOff className="w-5 h-5" />
+              <span className="text-sm font-medium hidden sm:inline">Kết thúc</span>
             </button>
           </div>
-
-          {/* Connection status dot */}
-          <div className="absolute top-3 right-3">
-            <span className={`w-2.5 h-2.5 rounded-full block ${
-              session.status === "active" ? "bg-green-400 animate-pulse" :
-              session.status === "connecting" ? "bg-yellow-400 animate-pulse" :
-              "bg-red-400"
-            }`} />
-          </div>
         </div>
-
-        {/* AI Avatar Panel — driven by real Gemini audio */}
-        <VideoAvatarPanel
-          step="questioning"
-          speakText={null}
-          isAiSpeakingLive={isAiSpeaking}
-        />
       </div>
 
-      {/* ── Right column: live transcript sidebar ────────────────────── */}
-      <div className="w-full lg:w-72 flex flex-col bg-white border border-gray-100 rounded-xl overflow-hidden">
-        {/* Header with status badge */}
-        <div className="px-4 py-2.5 border-b border-gray-100 flex items-center justify-between">
-          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Transcript</p>
-          <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full ${
-            session.status === "active" ? "bg-green-50 text-green-600" :
-            session.status === "connecting" ? "bg-yellow-50 text-yellow-600" :
-            session.status === "error" ? "bg-red-50 text-red-600" :
-            "bg-gray-50 text-gray-500"
-          }`}>
-            {session.status === "active" ? "Đang phỏng vấn" :
-             session.status === "connecting" ? "Đang kết nối..." :
-             session.status === "error" ? "Lỗi" :
-             session.status === "closed" ? "Đã kết thúc" : ""}
-          </span>
+      {/* Non-fatal error banner */}
+      {sessionError && hasTranscriptsRef.current && (
+        <div className="absolute bottom-20 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 bg-red-500/15 backdrop-blur-md border border-red-500/20 rounded-xl px-4 py-2">
+          <p className="text-xs text-red-400">{sessionError}</p>
+          <button
+            onClick={handleRetry}
+            title="Thử kết nối lại"
+            className="shrink-0 text-red-400 hover:text-red-300 cursor-pointer"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+          </button>
         </div>
-
-        <div className="flex-1 overflow-y-auto py-2 space-y-1 min-h-0">
-          {transcripts.length === 0 ? (
-            <p className="text-xs text-muted-foreground text-center py-6 px-4">
-              {session.status === "connecting" ? "Đang kết nối..." :
-               session.status === "active" ? "Nói để bắt đầu — AI sẽ chào bạn" :
-               "Cuộc trò chuyện chưa bắt đầu"}
-            </p>
-          ) : (
-            transcripts.map((t, i) => (
-              <ChatMessageBubble key={`${t.role}-${t.timestamp.getTime()}-${i}`} role={t.role} content={t.text} timestamp={t.timestamp} />
-            ))
-          )}
-          <div ref={transcriptEndRef} />
-        </div>
-
-        {/* Non-fatal error banner (has transcripts = interview started, just degraded) */}
-        {sessionError && hasTranscriptsRef.current && (
-          <div className="px-3 py-2 bg-red-50 border-t border-red-100 shrink-0 flex items-center justify-between gap-2">
-            <p className="text-xs text-red-600 flex-1">{sessionError}</p>
-            <button
-              onClick={handleRetry}
-              title="Thử kết nối lại"
-              className="shrink-0 text-red-500 hover:text-red-700"
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        )}
-      </div>
+      )}
     </div>
   )
 }

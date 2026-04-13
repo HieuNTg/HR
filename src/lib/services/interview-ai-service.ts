@@ -1,4 +1,4 @@
-import getGemini from "@/lib/gemini"
+import getGemini, { GeminiBlockedError } from "@/lib/gemini"
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -95,17 +95,18 @@ export function buildLiveSystemInstruction(params: {
   return `${SYSTEM_CONTEXT}
 Bạn đang phỏng vấn ${candidateName} cho vị trí ${jobTitle}.${cvBlock}${jdBlock}
 
-Hãy tiến hành phỏng vấn theo đúng 4 bước sau:
-1. Giới thiệu: Chào ứng viên, nhắc tên và vị trí ứng tuyển, đề cập 1 điểm nổi bật từ CV (nếu có). Mời ứng viên tự giới thiệu bản thân.
-2. Kinh nghiệm trong CV: Hỏi về một kinh nghiệm hoặc dự án nổi bật nhất mà ứng viên đã đề cập trong CV, liên hệ với yêu cầu JD.
-3. Mong muốn về môi trường làm việc và lương: Hỏi ứng viên mong muốn môi trường làm việc như thế nào và mức lương kỳ vọng.
-4. Kết thúc: Cảm ơn ứng viên đã tham gia buổi phỏng vấn, thông báo kết quả sẽ được gửi qua email trong thời gian sớm nhất.
+Tiến hành phỏng vấn theo trình tự sau (CHỈ dùng nội bộ, TUYỆT ĐỐI KHÔNG đề cập số bước hay trình tự với ứng viên):
+- Giới thiệu: Chào ứng viên, nhắc tên và vị trí ứng tuyển, đề cập 1 điểm nổi bật từ CV (nếu có). Mời ứng viên tự giới thiệu bản thân.
+- Kinh nghiệm trong CV: Hỏi về một kinh nghiệm hoặc dự án nổi bật nhất mà ứng viên đã đề cập trong CV, liên hệ với yêu cầu JD.
+- Mong muốn về môi trường làm việc và lương: Hỏi ứng viên mong muốn môi trường làm việc như thế nào và mức lương kỳ vọng.
+- Kết thúc: Cảm ơn ứng viên đã tham gia buổi phỏng vấn, thông báo kết quả sẽ được gửi qua email trong thời gian sớm nhất.
 
 Quy tắc:
+- TUYỆT ĐỐI KHÔNG tiết lộ cấu trúc nội bộ buổi phỏng vấn cho ứng viên (không nói "bước 1", "bước 2", "chuyển sang bước tiếp", "câu hỏi số X", v.v.). Chuyển đổi giữa các phần phải tự nhiên như cuộc trò chuyện bình thường.
 - Ngay khi nhận được bất kỳ âm thanh nào từ ứng viên (kể cả "xin chào"), hãy BẮT ĐẦU NGAY bằng lời chào cá nhân hóa (2-3 câu): nhắc tên ứng viên, vị trí ứng tuyển, và nhận xét tích cực về 1 điểm nổi bật từ CV
-- Đi qua đúng 4 bước theo thứ tự, chờ ứng viên trả lời xong mới chuyển bước tiếp theo
-- Phản hồi ngắn gọn (1 câu) sau mỗi câu trả lời để thể hiện sự lắng nghe, rồi chuyển sang bước tiếp
-- Ở bước 4, sau khi nói lời cảm ơn và thông báo kết quả qua email, kết thúc buổi phỏng vấn
+- Đi qua đúng các phần theo thứ tự, chờ ứng viên trả lời xong mới chuyển phần tiếp theo
+- Phản hồi ngắn gọn (1 câu) sau mỗi câu trả lời để thể hiện sự lắng nghe, rồi chuyển sang phần tiếp một cách tự nhiên
+- Ở phần kết thúc, sau khi nói lời cảm ơn và thông báo kết quả qua email, kết thúc buổi phỏng vấn
 - Giọng thân thiện, chuyên nghiệp, luôn dùng tiếng Việt`
 }
 
@@ -165,7 +166,7 @@ Yêu cầu:
   return getGemini().generateContent(prompt, {
     model: "gemini-3.1-flash-lite-preview",
     temperature: 0.7,
-    maxOutputTokens: 500,
+    maxOutputTokens: 800,
   })
 }
 
@@ -202,9 +203,151 @@ ${qaText}
   "weaknesses": ["điểm yếu 1"]
 }`
 
-  return getGemini().generateJSON<InterviewReportData>(prompt, {
-    model: "gemini-3.1-flash-lite-preview",
-    temperature: 0.3,
-    maxOutputTokens: 1500,
-  })
+  try {
+    return await getGemini().generateJSON<InterviewReportData>(prompt, {
+      model: "gemini-3.1-flash-lite-preview",
+      temperature: 0.3,
+      maxOutputTokens: 4000,
+      timeout: 60_000,
+      thinkingBudget: 0,
+    })
+  } catch (error) {
+    // When Gemini blocks the report (SAFETY/RECITATION), degrade gracefully to a score-based report
+    // so the candidate still gets a result instead of a 500 error.
+    if (error instanceof GeminiBlockedError) {
+      console.warn(`[generateInterviewReport] ${error.message} — returning fallback report from scores`)
+      return buildFallbackReport(questionsAndAnswers)
+    }
+    throw error
+  }
+}
+
+/**
+ * Single-shot audio → QA + report generator. Gemini listens to the raw interview
+ * recording (mic + AI mixed) and produces per-question evaluations plus the final
+ * report in ONE multimodal call.
+ *
+ * Why one call: audio is large (30+ MB). Uploading once and extracting everything
+ * in a single pass avoids re-sending the file for each evaluation and cuts latency.
+ */
+export async function generateReportFromAudio(
+  params: {
+    audio: { uri: string; mimeType: string }
+    questions: GeneratedQuestion[]
+    candidateName: string
+    jobTitle: string
+    signal?: AbortSignal
+  },
+): Promise<{
+  questionsAndAnswers: Array<{ question: string; answer: string; evaluation: AnswerEvaluation }>
+  report: InterviewReportData
+}> {
+  const { audio, questions, candidateName, jobTitle, signal } = params
+
+  const questionList = questions
+    .map((q, i) => `Q${i + 1} (${q.category}, ${q.difficulty}): ${q.questionText}`)
+    .join("\n")
+
+  const prompt = `${SYSTEM_CONTEXT}
+
+Bạn sẽ nghe bản ghi âm buổi phỏng vấn (gồm cả tiếng AI và ứng viên) và tạo báo cáo tổng hợp bằng tiếng Việt.
+
+**Ứng viên:** ${candidateName}
+**Vị trí:** ${jobTitle}
+
+**Các câu hỏi AI đã hỏi (theo kịch bản):**
+${questionList}
+
+Nhiệm vụ:
+1. Nghe toàn bộ audio, xác định phần ứng viên trả lời cho từng câu hỏi ở trên.
+2. Với mỗi câu hỏi, trích xuất nội dung ứng viên thực sự nói (không paraphrase nhiều; giữ sát lời gốc, bỏ "ờ", "à" nếu nhiều).
+3. Chấm điểm 0-10 từng câu dựa trên: độ liên quan tới câu hỏi, độ sâu/cụ thể, sự rõ ràng, phù hợp với vị trí ${jobTitle}.
+4. Cũng đánh giá chất lượng giao tiếp qua giọng nói (sự tự tin, rõ ràng, trôi chảy) — phản ánh vào scoreCommunication.
+5. Nếu ứng viên không trả lời một câu nào, set answer="(Không trả lời)" và score=0.
+
+Trả về JSON DUY NHẤT đúng schema sau, KHÔNG kèm giải thích ngoài JSON:
+{
+  "questionsAndAnswers": [
+    {
+      "question": "đúng nguyên văn câu hỏi Q1",
+      "answer": "lời ứng viên trả lời Q1 (trích từ audio)",
+      "evaluation": {
+        "score": 7,
+        "feedback": "nhận xét ngắn bằng tiếng Việt",
+        "strengths": ["điểm mạnh 1"],
+        "improvements": ["cần cải thiện 1"]
+      }
+    }
+  ],
+  "report": {
+    "overallScore": 7.5,
+    "scoreTechnical": 8,
+    "scoreExperience": 7,
+    "scoreCommunication": 8,
+    "scoreProblemSolving": 7,
+    "attitude": "Tích cực|Trung lập|Tiêu cực",
+    "recommendation": "STRONGLY_RECOMMEND|RECOMMEND|CONSIDER|REJECT",
+    "recommendationReason": "Lý do ngắn bằng tiếng Việt, dẫn chứng cụ thể từ câu trả lời",
+    "strengths": ["điểm mạnh tổng 1", "điểm mạnh tổng 2"],
+    "weaknesses": ["điểm yếu 1"]
+  }
+}
+
+Yêu cầu về độ dài questionsAndAnswers: đúng ${questions.length} phần tử theo thứ tự câu hỏi ở trên.`
+
+  try {
+    return await getGemini().generateJSONWithFile<{
+      questionsAndAnswers: Array<{ question: string; answer: string; evaluation: AnswerEvaluation }>
+      report: InterviewReportData
+    }>(prompt, audio, {
+      model: "gemini-3.1-flash-lite-preview",
+      temperature: 0.3,
+      maxOutputTokens: 6000,
+      timeout: 120_000,
+      thinkingBudget: 0,
+      signal,
+    })
+  } catch (error) {
+    if (error instanceof GeminiBlockedError) {
+      console.warn(`[generateReportFromAudio] ${error.message} — returning empty fallback`)
+      // Degrade: return empty QA + zero-score report so caller can still persist something
+      const emptyQA = questions.map((q) => ({
+        question: q.questionText,
+        answer: "(Không thể xử lý audio)",
+        evaluation: { score: 0, feedback: "Không thể đánh giá — AI từ chối xử lý audio", strengths: [], improvements: [] },
+      }))
+      return {
+        questionsAndAnswers: emptyQA,
+        report: buildFallbackReport(emptyQA.map((qa) => ({ question: qa.question, answer: qa.answer, score: 0 }))),
+      }
+    }
+    throw error
+  }
+}
+
+function buildFallbackReport(
+  qa: Array<{ question: string; answer: string; score: number }>,
+): InterviewReportData {
+  const validScores = qa.map((q) => q.score).filter((s) => typeof s === "number" && !Number.isNaN(s))
+  const avg = validScores.length ? validScores.reduce((a, b) => a + b, 0) / validScores.length : 0
+  const overallScore = Math.round(avg * 10) / 10
+
+  const recommendation: InterviewReportData["recommendation"] =
+    overallScore >= 8 ? "STRONGLY_RECOMMEND"
+    : overallScore >= 6.5 ? "RECOMMEND"
+    : overallScore >= 5 ? "CONSIDER"
+    : "REJECT"
+
+  return {
+    overallScore,
+    scoreTechnical: overallScore,
+    scoreExperience: overallScore,
+    scoreCommunication: overallScore,
+    scoreProblemSolving: overallScore,
+    attitude: overallScore >= 6 ? "Tích cực" : "Trung lập",
+    recommendation,
+    recommendationReason: `Điểm trung bình ${overallScore}/10 dựa trên ${validScores.length} câu trả lời. (Báo cáo tự động — AI không thể tạo nhận xét chi tiết.)`,
+    strengths: [],
+    weaknesses: [],
+  }
 }

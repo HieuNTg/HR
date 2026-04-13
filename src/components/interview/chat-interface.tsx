@@ -1,7 +1,7 @@
 "use client"
 
 import { useState, useRef, useEffect, useCallback } from "react"
-import { Send } from "lucide-react"
+import { Send, MessageSquare } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ChatMessageBubble } from "./chat-message-bubble"
 import { TypingIndicator } from "./typing-indicator"
@@ -12,9 +12,7 @@ interface ChatInterfaceProps {
   loading: boolean
   disabled: boolean
   onSend: (message: string) => void
-  /** ID of message currently being spoken by TTS */
   streamingMsgId?: string | null
-  /** How many chars of the streaming message have been spoken */
   spokenCharIndex?: number
 }
 
@@ -23,7 +21,6 @@ export function ChatInterface({ messages, loading, disabled, onSend, streamingMs
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
-  // Auto-scroll to bottom
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [])
@@ -32,14 +29,12 @@ export function ChatInterface({ messages, loading, disabled, onSend, streamingMs
     scrollToBottom()
   }, [messages, loading, spokenCharIndex, scrollToBottom])
 
-  // Focus input when not disabled
   useEffect(() => {
     if (!disabled && !loading) {
       inputRef.current?.focus()
     }
   }, [disabled, loading])
 
-  // Auto-resize textarea
   const autoResize = useCallback(() => {
     const el = inputRef.current
     if (!el) return
@@ -55,7 +50,6 @@ export function ChatInterface({ messages, loading, disabled, onSend, streamingMs
     const text = input.trim()
     if (!text || disabled || loading) return
     setInput("")
-    // Reset height after clearing
     if (inputRef.current) inputRef.current.style.height = "auto"
     onSend(text)
   }
@@ -74,8 +68,11 @@ export function ChatInterface({ messages, loading, disabled, onSend, streamingMs
       {/* Messages area */}
       <div className="flex-1 overflow-y-auto py-4 space-y-1">
         {messages.length === 0 && !loading && (
-          <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
-            Đang bắt đầu phỏng vấn...
+          <div className="flex flex-col items-center justify-center h-full gap-3 text-muted-foreground">
+            <div className="w-12 h-12 rounded-full bg-muted/50 flex items-center justify-center">
+              <MessageSquare className="w-5 h-5" />
+            </div>
+            <p className="text-sm">Đang bắt đầu phỏng vấn...</p>
           </div>
         )}
         {messages.map((msg) => (
@@ -92,8 +89,8 @@ export function ChatInterface({ messages, loading, disabled, onSend, streamingMs
       </div>
 
       {/* Input area */}
-      <div className="border-t p-3">
-        <div className="flex gap-2">
+      <div className="border-t border-border/50 p-3 bg-background/50">
+        <div className="flex gap-2 items-end">
           <textarea
             ref={inputRef}
             value={input}
@@ -101,13 +98,14 @@ export function ChatInterface({ messages, loading, disabled, onSend, streamingMs
             onKeyDown={handleKeyDown}
             placeholder={disabled ? "Phỏng vấn đã kết thúc" : "Nhập câu trả lời..."}
             disabled={disabled || loading}
-            className="flex-1 resize-none overflow-y-auto rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+            className="flex-1 resize-none overflow-y-auto rounded-xl border border-input bg-background px-4 py-2.5 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50 transition-shadow"
             rows={1}
           />
           <Button
             size="icon"
             onClick={handleSend}
             disabled={!canSend}
+            className="h-10 w-10 rounded-xl shrink-0 cursor-pointer"
           >
             <Send className="w-4 h-4" />
           </Button>

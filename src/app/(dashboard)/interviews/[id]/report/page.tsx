@@ -6,7 +6,7 @@ import { ArrowLeft, Printer, Brain } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { InterviewReportCard } from "@/components/interview/interview-report-card"
-import { InterviewTranscript } from "@/components/interview/interview-transcript"
+
 import { useInterviewStore } from "@/stores/interview-store"
 
 export default function InterviewReportPage() {
@@ -55,11 +55,6 @@ export default function InterviewReportPage() {
           candidateName={store.candidateName ?? "Ứng viên"}
           jobTitle={store.jobTitle ?? "Vị trí"}
         />
-      </div>
-
-      {/* Transcript */}
-      <div className="border rounded-xl p-4 bg-card shadow-sm">
-        <InterviewTranscript messages={store.messages} />
       </div>
 
       {/* Footer actions */}

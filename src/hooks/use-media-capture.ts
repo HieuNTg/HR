@@ -7,9 +7,13 @@ import { captureFrame } from "@/lib/video-utils"
 export interface UseMediaCaptureOptions {
   onAudioChunk: (pcm16: ArrayBuffer) => void
   onVideoFrame: (jpegBase64: string) => void
-  videoFps?: number      // default 1
-  videoWidth?: number    // default 768
-  videoHeight?: number   // default 768
+  videoFps?: number        // default 0.5
+  captureWidth?: number    // frame sent to Gemini, default 512
+  captureHeight?: number   // frame sent to Gemini, default 512
+  /** Optional AI audio MediaStream — mixed into the recording so the saved blob
+   *  contains both mic + AI speech. Provided lazily so the hook is agnostic to
+   *  session startup order. */
+  getExtraAudioStream?: () => MediaStream | null
 }
 
 export type CaptureStatus = "idle" | "requesting" | "active" | "error" | "denied"
@@ -25,14 +29,18 @@ export interface UseMediaCaptureReturn {
   hasCamera: boolean
   hasMic: boolean
   getRecordedAudio: () => Blob | null
+  /** Stop the recorder and resolve with the final flushed Blob. Safe to call
+   *  before stop() — ensures trailing audio chunks are captured. */
+  stopRecordingAndGetAudio: () => Promise<Blob | null>
 }
 
 export function useMediaCapture({
   onAudioChunk,
   onVideoFrame,
-  videoFps = 1,
-  videoWidth = 768,
-  videoHeight = 768,
+  videoFps = 0.5,
+  captureWidth = 512,
+  captureHeight = 512,
+  getExtraAudioStream,
 }: UseMediaCaptureOptions): UseMediaCaptureReturn {
   const [status, setStatus] = useState<CaptureStatus>("idle")
   const [error, setError] = useState<string | null>(null)
@@ -50,6 +58,10 @@ export function useMediaCapture({
   const isMutedRef = useRef(false)
   const isStartingRef = useRef(false)
   const recordedMimeRef = useRef("audio/webm")
+  // Mix destination for mic + AI audio — feeds MediaRecorder
+  const mixDestRef = useRef<MediaStreamAudioDestinationNode | null>(null)
+  const getExtraAudioStreamRef = useRef(getExtraAudioStream)
+  useEffect(() => { getExtraAudioStreamRef.current = getExtraAudioStream }, [getExtraAudioStream])
 
   // Stable callback refs — avoid stale closures in worklet handler
   const onAudioChunkRef = useRef(onAudioChunk)
@@ -72,6 +84,8 @@ export function useMediaCapture({
     }
     workletNodeRef.current?.disconnect()
     workletNodeRef.current = null
+    mixDestRef.current?.disconnect()
+    mixDestRef.current = null
     audioCtxRef.current?.close()
     audioCtxRef.current = null
     streamRef.current?.getTracks().forEach((t) => t.stop())
@@ -97,7 +111,7 @@ export function useMediaCapture({
       }
 
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: videoWidth }, height: { ideal: videoHeight }, facingMode: "user" },
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
         audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
       })
       streamRef.current = stream
@@ -131,19 +145,36 @@ export function useMediaCapture({
       source.connect(workletNode)
       // No connect to destination — capture only, no mic playback
 
+      // ── Mix mic + AI output for recording ───────────────────────────────
+      // We feed a MediaStreamAudioDestinationNode on the capture AudioContext.
+      // MediaStreamAudioSourceNode auto-resamples the incoming stream, so the
+      // player's 24kHz context and this context (device rate) interop safely.
+      const mixDest = audioCtx.createMediaStreamDestination()
+      mixDestRef.current = mixDest
+      source.connect(mixDest) // mic → mix
+      const extraStream = getExtraAudioStreamRef.current?.()
+      if (extraStream && extraStream.getAudioTracks().length) {
+        const aiSource = audioCtx.createMediaStreamSource(extraStream)
+        aiSource.connect(mixDest) // AI → mix
+      } else {
+        console.warn("[media-capture] no AI audio stream — recording mic only")
+      }
+
       // ── Video frame capture ─────────────────────────────────────────────
       videoIntervalRef.current = setInterval(() => {
         const video = videoRef.current
         if (!video || video.readyState < 2) return
-        const frame = captureFrame(video, videoWidth, videoHeight)
+        const videoTrack = streamRef.current?.getVideoTracks()[0]
+        if (!videoTrack?.enabled) return
+        const frame = captureFrame(video, captureWidth, captureHeight)
         onVideoFrameRef.current(frame)
       }, Math.round(1000 / videoFps))
 
       // ── MediaRecorder for audio saving (WebM/OGG) ──────────────────────
-      const audioOnlyStream = new MediaStream(stream.getAudioTracks())
+      // Records the MIXED stream (mic + AI) so the saved blob contains the full conversation.
       const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/ogg"
       recordedMimeRef.current = mimeType
-      const recorder = new MediaRecorder(audioOnlyStream, { mimeType })
+      const recorder = new MediaRecorder(mixDest.stream, { mimeType })
       recorderRef.current = recorder
       recorder.ondataavailable = (e) => {
         if (e.data.size > 0) recordedChunksRef.current.push(e.data)
@@ -160,7 +191,7 @@ export function useMediaCapture({
     } finally {
       isStartingRef.current = false
     }
-  }, [status, videoWidth, videoHeight, videoFps, stop])
+  }, [status, captureWidth, captureHeight, videoFps, stop])
 
   const toggleMute = useCallback(() => {
     const track = streamRef.current?.getAudioTracks()[0]
@@ -168,6 +199,13 @@ export function useMediaCapture({
     track.enabled = !track.enabled
     isMutedRef.current = !track.enabled
     setIsMuted(!track.enabled)
+    // Pause/resume recorder so saved audio respects mute state
+    const rec = recorderRef.current
+    if (!track.enabled) {
+      if (rec?.state === "recording") rec.pause()
+    } else {
+      if (rec?.state === "paused") rec.resume()
+    }
   }, [])
 
   const getRecordedAudio = useCallback((): Blob | null => {
@@ -176,8 +214,18 @@ export function useMediaCapture({
     return new Blob(chunks, { type: recordedMimeRef.current })
   }, [])
 
+  const stopRecordingAndGetAudio = useCallback((): Promise<Blob | null> => {
+    const rec = recorderRef.current
+    if (!rec || rec.state === "inactive") return Promise.resolve(getRecordedAudio())
+    return new Promise((resolve) => {
+      const finish = () => resolve(getRecordedAudio())
+      rec.addEventListener("stop", finish, { once: true })
+      try { rec.stop() } catch { finish() }
+    })
+  }, [getRecordedAudio])
+
   // Cleanup on unmount
   useEffect(() => () => { stop() }, [stop])
 
-  return { status, error, videoRef, start, stop, toggleMute, isMuted, hasCamera, hasMic, getRecordedAudio }
+  return { status, error, videoRef, start, stop, toggleMute, isMuted, hasCamera, hasMic, getRecordedAudio, stopRecordingAndGetAudio }
 }

@@ -80,7 +80,7 @@ interface InterviewState {
   setLiveSessionStatus: (status: LiveSessionStatus) => void
   setAiSpeaking: (speaking: boolean) => void
   addLiveTranscript: (role: "ai" | "candidate", text: string) => void
-  saveLiveResults: () => Promise<void>
+  saveLiveResults: (audio?: Blob | null) => Promise<void>
 }
 
 let messageCounter = 0
@@ -148,18 +148,25 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
       // Response fully consumed — clear controller so re-entry abort is a no-op
       set({ _abortController: null })
 
-      // Combine greeting + first question into single opening message
-      const firstQuestion = data.questions[0]
-      const combinedContent = firstQuestion
-        ? `${data.greeting}\n\n${firstQuestion.questionText}`
-        : data.greeting
+      // Only add text greeting for TEXT mode — live sessions generate their own greeting
+      const initialMessages: ChatMessage[] = []
+      const isTextMode = get().interviewMode === "TEXT"
 
-      const greetingMsg: ChatMessage = {
-        id: nextMessageId(),
-        role: "ai",
-        content: combinedContent,
-        timestamp: new Date(),
+      if (isTextMode) {
+        const firstQuestion = data.questions[0]
+        const combinedContent = firstQuestion
+          ? `${data.greeting}\n\n${firstQuestion.questionText}`
+          : data.greeting
+
+        initialMessages.push({
+          id: nextMessageId(),
+          role: "ai",
+          content: combinedContent,
+          timestamp: new Date(),
+        })
       }
+
+      const firstQuestion = data.questions[0]
 
       set({
         candidateName: data.candidateName,
@@ -169,7 +176,7 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
         questions: data.questions,
         currentQuestionIndex: 0,
         results: [],
-        messages: [greetingMsg],
+        messages: initialMessages,
         step: firstQuestion ? "questioning" : "greeting",
         loading: false,
       })
@@ -252,7 +259,17 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
 
   async endInterview() {
     const { candidateName, jobTitle, results } = get()
-    if (!candidateName || !jobTitle) return
+    if (!candidateName || !jobTitle) {
+      console.error("endInterview: missing candidateName or jobTitle", { candidateName, jobTitle })
+      set({ loading: false, step: "error", error: "Thiếu thông tin ứng viên. Vui lòng thử lại." })
+      return
+    }
+
+    if (!results.length) {
+      console.error("endInterview: no results to generate report from")
+      set({ loading: false, step: "error", error: "Không có dữ liệu phỏng vấn để tạo báo cáo. Vui lòng thử lại." })
+      return
+    }
 
     set({ step: "generating-report", loading: true })
 
@@ -270,13 +287,17 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
           })),
         }),
       })
-      if (!res.ok) throw new Error("Report generation failed")
+      if (!res.ok) {
+        const errorBody = await res.text().catch(() => "")
+        throw new Error(`Report generation failed (${res.status}): ${errorBody.slice(0, 200)}`)
+      }
       const data = await res.json()
 
       set({ report: data.report, step: "report", loading: false })
     } catch (error) {
       console.error("Report error:", error)
-      set({ loading: false, step: "closing" })
+      const msg = error instanceof Error ? error.message : "Không thể tạo báo cáo phỏng vấn"
+      set({ loading: false, step: "error", error: msg })
     }
   },
 
@@ -298,22 +319,42 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
     }))
   },
 
-  async saveLiveResults() {
+  async saveLiveResults(audio) {
     const { candidateId, candidateName, jobTitle, messages } = get()
     if (!candidateId) return
 
     set({ step: "generating-report", loading: true })
 
+    const metadata = {
+      transcripts: messages.map((m) => ({ role: m.role, text: m.content })),
+      questions: LIVE_INTERVIEW_QUESTIONS,
+      candidateName,
+      jobTitle,
+    }
+
+    let audioBasedReport: InterviewReportData | null = null
+
     try {
-      const res = await fetch(`/api/interviews/${candidateId}/save-live-results`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transcripts: messages.map((m) => ({ role: m.role, text: m.content })), questions: LIVE_INTERVIEW_QUESTIONS, candidateName, jobTitle }),
-      })
-      if (!res.ok) throw new Error("Save live results failed")
+      let res: Response
+      if (audio && audio.size > 0) {
+        const form = new FormData()
+        form.append("audio", audio, "interview.webm")
+        form.append("metadata", JSON.stringify(metadata))
+        res = await fetch(`/api/interviews/${candidateId}/save-live-results`, { method: "POST", body: form })
+      } else {
+        res = await fetch(`/api/interviews/${candidateId}/save-live-results`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(metadata),
+        })
+      }
+
+      if (!res.ok) {
+        const errorBody = await res.text().catch(() => "")
+        throw new Error(`Save live results failed (${res.status}): ${errorBody.slice(0, 200)}`)
+      }
       const data = await res.json()
 
-      // Populate results for report generation
       if (data.questionsAndAnswers?.length) {
         set({ results: data.questionsAndAnswers.map((qa: { question: string; answer: string; evaluation: AnswerEvaluation }) => ({
           question: qa.question,
@@ -321,8 +362,19 @@ export const useInterviewStore = create<InterviewState>((set, get) => ({
           evaluation: qa.evaluation,
         })) })
       }
+
+      // Audio path returns the full report in the same response — skip the /report call below.
+      if (data.report) audioBasedReport = data.report as InterviewReportData
     } catch (e) {
       console.error("saveLiveResults error:", e)
+      const msg = e instanceof Error ? e.message : "Không thể xử lý kết quả phỏng vấn"
+      set({ loading: false, step: "error", error: msg })
+      return
+    }
+
+    if (audioBasedReport) {
+      set({ report: audioBasedReport, step: "report", loading: false })
+      return
     }
 
     await get().endInterview()

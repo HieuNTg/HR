@@ -41,3 +41,5 @@ console.error = function (...args: unknown[]) {
 }
 
 console.log("🔧 [instrumentation-node] process.emit override installed")
+
+export {}

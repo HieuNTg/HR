@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react"
 import { useParams, useRouter } from "next/navigation"
-import { Phone, Brain, RefreshCw, Video, MessageSquare } from "lucide-react"
+import { Phone, Brain, RefreshCw, Video, MessageSquare, Clock } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { VideoAvatarPanel } from "@/components/interview/video-avatar-panel"
@@ -17,25 +17,21 @@ export default function InterviewSessionPage() {
   const router = useRouter()
   const store = useInterviewStore()
 
-  // Track latest AI message for TTS + text stream sync
   const [speakText, setSpeakText] = useState<string | null>(null)
   const [lastSpokenMsgId, setLastSpokenMsgId] = useState<string | null>(null)
   const [streamingMsgId, setStreamingMsgId] = useState<string | null>(null)
   const [spokenCharIndex, setSpokenCharIndex] = useState(0)
 
-  // Reset store if needed, then start interview — single effect to avoid stale closure issues
   useEffect(() => {
     if (!id) return
 
     const s = useInterviewStore.getState()
 
-    // Reset if different candidate, or re-visiting same candidate after completion
     const needsReset =
       (s.candidateId && s.candidateId !== id && s.step !== "idle") ||
       (s.candidateId === id && !["idle", "loading"].includes(s.step))
     if (needsReset) s.reset()
 
-    // Start interview (reset() is synchronous so getState() now returns step="idle")
     const current = useInterviewStore.getState()
     if (current.step === "idle") {
       if (id.startsWith("gen-")) {
@@ -49,14 +45,9 @@ export default function InterviewSessionPage() {
         current.startInterview(id)
       }
     }
-
-    // No cleanup abort — let in-flight fetch complete naturally.
-    // StrictMode guard (step !== "idle") prevents double-fetch on remount.
-    // Abort only happens via store.reset() on intentional navigation.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id])
 
-  // Speak new AI messages via TTS (text mode only)
   useEffect(() => {
     if (store.interviewMode !== "TEXT") return
     const lastMsg = store.messages[store.messages.length - 1]
@@ -88,8 +79,8 @@ export default function InterviewSessionPage() {
     }
   }, [store])
 
-  const handleVideoSessionEnd = useCallback(() => {
-    store.saveLiveResults()
+  const handleVideoSessionEnd = useCallback((audio: Blob | null) => {
+    store.saveLiveResults(audio)
   }, [store])
 
   const handleVideoTranscript = useCallback((text: string, role: "ai" | "candidate") => {
@@ -104,7 +95,6 @@ export default function InterviewSessionPage() {
     store.setInterviewMode(store.interviewMode === "TEXT" ? "VOICE" : "TEXT")
   }, [store])
 
-  // Navigate to report when ready
   useEffect(() => {
     if (store.step === "report") {
       router.push(`/interviews/${id}/report`)
@@ -115,7 +105,6 @@ export default function InterviewSessionPage() {
   const canEnd = store.step === "closing" || (store.step === "questioning" && store.results.length > 0)
   const isVideoMode = store.interviewMode !== "TEXT"
 
-  // Build system instruction once questions are available
   const systemInstruction = store.candidateName && store.jobTitle
     ? buildLiveSystemInstruction({
         candidateName: store.candidateName,
@@ -128,32 +117,42 @@ export default function InterviewSessionPage() {
   return (
     <div className="flex flex-col h-[calc(100vh-3.5rem)] -m-6">
       {/* Header bar */}
-      <div className="flex items-center justify-between px-4 py-2.5 border-b bg-background shrink-0">
-        <div className="flex items-center gap-2.5">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-border/50 bg-background/95 backdrop-blur-sm shrink-0">
+        <div className="flex items-center gap-3">
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/novagroup-logo.webp" alt="NovaGroup" width={28} height={28} />
+          <img src="/novagroup-logo.webp" alt="NovaGroup" width={28} height={28} className="rounded-lg" />
           <div>
-            <h1 className="text-sm font-semibold">
+            <h1 className="text-sm font-semibold leading-tight">
               NovaGroup AI Interview
             </h1>
             {store.candidateName && (
-              <p className="text-[11px] text-muted-foreground">
+              <p className="text-[11px] text-muted-foreground leading-tight">
                 {store.candidateName} — {store.jobTitle}
               </p>
             )}
           </div>
+
+          {/* Status pill */}
+          {isInterviewActive && (
+            <div className="flex items-center gap-1.5 ml-2 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 rounded-full px-2.5 py-0.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+              <span className="text-[10px] font-medium">Live</span>
+            </div>
+          )}
         </div>
+
         <div className="flex items-center gap-2">
           {isInterviewActive && (
             <Button
               variant="outline"
               size="sm"
               onClick={toggleMode}
+              className="h-8 text-xs gap-1.5 cursor-pointer"
               title={isVideoMode ? "Chuyển sang chế độ văn bản" : "Chuyển sang chế độ video"}
             >
               {isVideoMode
-                ? <><MessageSquare className="w-3.5 h-3.5 mr-1.5" />Văn bản</>
-                : <><Video className="w-3.5 h-3.5 mr-1.5" />Video</>}
+                ? <><MessageSquare className="w-3.5 h-3.5" />Văn bản</>
+                : <><Video className="w-3.5 h-3.5" />Video</>}
             </Button>
           )}
           {!isVideoMode && (
@@ -162,8 +161,9 @@ export default function InterviewSessionPage() {
               size="sm"
               onClick={handleEndInterview}
               disabled={!canEnd}
+              className="h-8 text-xs gap-1.5 cursor-pointer"
             >
-              <Phone className="w-3.5 h-3.5 mr-1.5" />
+              <Phone className="w-3.5 h-3.5" />
               Kết thúc phỏng vấn
             </Button>
           )}
@@ -172,36 +172,54 @@ export default function InterviewSessionPage() {
 
       {/* Main content */}
       {store.step === "error" ? (
-        <div className="flex-1 flex items-center justify-center">
-          <div className="text-center space-y-4">
-            <p className="text-sm text-destructive">{store.error}</p>
-            <Button variant="outline" size="sm" onClick={() => store.retryStart()}>
+        <div className="flex-1 flex items-center justify-center bg-muted/20">
+          <div className="text-center space-y-4 max-w-sm">
+            <div className="w-14 h-14 mx-auto rounded-full bg-destructive/10 flex items-center justify-center">
+              <RefreshCw className="w-6 h-6 text-destructive" />
+            </div>
+            <div className="space-y-1.5">
+              <p className="text-sm font-medium">Đã xảy ra lỗi</p>
+              <p className="text-sm text-muted-foreground">{store.error}</p>
+            </div>
+            <Button variant="outline" size="sm" onClick={() => store.retryStart()} className="cursor-pointer">
               <RefreshCw className="w-4 h-4 mr-1.5" />
               Thử lại
             </Button>
           </div>
         </div>
       ) : store.step === "loading" ? (
-        <div className="flex-1 flex items-center justify-center">
-          <div className="text-center space-y-3">
-            <div className="w-12 h-12 mx-auto rounded-full bg-primary/10 flex items-center justify-center animate-pulse">
-              <Brain className="w-6 h-6 text-primary" />
+        <div className="flex-1 flex items-center justify-center bg-muted/20">
+          <div className="text-center space-y-4">
+            <div className="relative w-16 h-16 mx-auto">
+              <div className="absolute inset-0 rounded-full bg-primary/10 animate-ping" />
+              <div className="relative w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center">
+                <Brain className="w-7 h-7 text-primary" />
+              </div>
             </div>
-            <p className="text-sm text-muted-foreground">Đang chuẩn bị câu hỏi phỏng vấn...</p>
+            <div className="space-y-1">
+              <p className="text-sm font-medium">Đang chuẩn bị phỏng vấn</p>
+              <p className="text-xs text-muted-foreground">Hệ thống đang tạo câu hỏi phù hợp...</p>
+            </div>
           </div>
         </div>
       ) : store.step === "generating-report" ? (
-        <div className="flex-1 flex items-center justify-center">
-          <div className="text-center space-y-3">
-            <div className="w-12 h-12 mx-auto rounded-full bg-primary/10 flex items-center justify-center animate-pulse">
-              <Brain className="w-6 h-6 text-primary" />
+        <div className="flex-1 flex items-center justify-center bg-muted/20">
+          <div className="text-center space-y-4">
+            <div className="relative w-16 h-16 mx-auto">
+              <div className="absolute inset-0 rounded-full bg-primary/10 animate-ping" />
+              <div className="relative w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center">
+                <Brain className="w-7 h-7 text-primary" />
+              </div>
             </div>
-            <p className="text-sm text-muted-foreground">Đang tạo báo cáo phỏng vấn...</p>
+            <div className="space-y-1">
+              <p className="text-sm font-medium">Đang tạo báo cáo</p>
+              <p className="text-xs text-muted-foreground">AI đang phân tích và đánh giá kết quả phỏng vấn...</p>
+            </div>
           </div>
         </div>
       ) : isVideoMode && isInterviewActive && systemInstruction ? (
         // ── Video mode ──────────────────────────────────────────────────────
-        <div className="flex-1 p-4 min-h-0">
+        <div className="flex-1 p-2 min-h-0">
           <VideoInterviewInterface
             interviewId={store.candidateId ?? ""}
             systemInstruction={systemInstruction}
@@ -216,8 +234,9 @@ export default function InterviewSessionPage() {
         </div>
       ) : (
         // ── Text mode (Google Meet style) ───────────────────────────────────
-        <div className="flex-1 grid grid-cols-1 lg:grid-cols-[360px_1fr] gap-0 min-h-0">
-          <div className="hidden lg:flex lg:items-center lg:justify-center border-r p-4 bg-muted/30">
+        <div className="flex-1 grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-0 min-h-0">
+          {/* AI Avatar sidebar */}
+          <div className="hidden lg:flex lg:flex-col lg:items-center lg:justify-center border-r border-border/50 p-4 bg-muted/20">
             <VideoAvatarPanel
               step={store.step}
               speakText={speakText}
@@ -225,6 +244,7 @@ export default function InterviewSessionPage() {
               onSpokenProgress={handleSpokenProgress}
             />
           </div>
+          {/* Chat area */}
           <div className="min-h-0 flex flex-col">
             <ChatInterface
               messages={store.messages}

@@ -17,8 +17,9 @@ import {
 const interviews = [
   {
     id: "1",
-    candidate: "Nguyễn Văn A",
-    position: "Senior Frontend Developer",
+    candidateId: "src-2",
+    candidate: "Nguyễn Văn Hùng",
+    position: "Nhân viên Mua hàng",
     type: "AI",
     scheduledAt: "26/03/2026 09:00",
     duration: "45 phút",
@@ -27,8 +28,9 @@ const interviews = [
   },
   {
     id: "2",
-    candidate: "Trần Thị B",
-    position: "Product Manager",
+    candidateId: "src-3",
+    candidate: "Lê Thị Hồng Nhung",
+    position: "Nhân viên Mua hàng",
     type: "AI",
     scheduledAt: "26/03/2026 14:00",
     duration: "60 phút",
@@ -37,8 +39,9 @@ const interviews = [
   },
   {
     id: "3",
-    candidate: "Lê Văn C",
-    position: "Backend Developer",
+    candidateId: "src-9",
+    candidate: "Trịnh Hoàng Nam",
+    position: "Nhân viên Mua hàng",
     type: "AI",
     scheduledAt: "27/03/2026 10:00",
     duration: "45 phút",
@@ -47,8 +50,9 @@ const interviews = [
   },
   {
     id: "4",
-    candidate: "Phạm Thị D",
-    position: "UI/UX Designer",
+    candidateId: "src-7",
+    candidate: "Huỳnh Thị Thanh Tâm",
+    position: "Nhân viên Mua hàng",
     type: "AI",
     scheduledAt: "25/03/2026 11:00",
     duration: "45 phút",
@@ -57,8 +61,9 @@ const interviews = [
   },
   {
     id: "5",
-    candidate: "Hoàng Văn E",
-    position: "DevOps Engineer",
+    candidateId: "ai-1",
+    candidate: "Nguyễn Hoàng Khoa",
+    position: "AI Engineer",
     type: "AI",
     scheduledAt: "24/03/2026 15:00",
     duration: "60 phút",
@@ -134,7 +139,7 @@ export default function InterviewsPage() {
                 >
                   <TableCell className="font-medium">
                     <Link
-                      href={`/interviews/${interview.id}`}
+                      href={`/interviews/${interview.candidateId}`}
                       className="hover:underline"
                     >
                       {interview.candidate}

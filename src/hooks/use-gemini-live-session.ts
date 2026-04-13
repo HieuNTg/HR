@@ -11,6 +11,11 @@ const GEMINI_LIVE_MODEL = "models/gemini-3.1-flash-live-preview"
 const SILENCE_FALLBACK_PCM = new Int16Array(2048) // all zeros
 
 const MAX_RECONNECT_ATTEMPTS = 3
+// How long user must be silent before we signal end-of-turn to Gemini (ms).
+// Longer = user gets more thinking time; shorter = snappier AI responses.
+const SILENCE_BEFORE_TURN_END_MS = 5000
+// RMS threshold to consider mic input as "speech" (16-bit scale, 0–32767)
+const SPEECH_RMS_THRESHOLD = 800
 const RECONNECTABLE_CODES = new Set([1006, 1011, 1012, 1013])
 
 /** Human-readable WebSocket close code labels (Vietnamese for production UI) */
@@ -45,6 +50,8 @@ export interface UseGeminiLiveSessionReturn {
   sendText: (text: string) => void
   isAiSpeaking: boolean
   warmUpAudio: () => Promise<void>
+  /** MediaStream of AI audio output — for mixing into a recording of the full conversation */
+  getAiAudioStream: () => MediaStream | null
 }
 
 /** ArrayBuffer → base64 (thin wrapper around the canonical util) */
@@ -79,7 +86,12 @@ export function useGeminiLiveSession({
   const MAX_MISSED_TURNS = 3
   // Track whether AI sent audio in the current turn (more precise than text-only check)
   const aiHasAudioThisTurnRef = useRef(false)
+  // Gate mic→WS until AI's first turn completes — prevents greeting interruption
+  const firstTurnDoneRef = useRef(false)
   const reconnectAttemptsRef = useRef(0)
+  // Client-side silence timer — sends audioStreamEnd after SILENCE_BEFORE_TURN_END_MS of silence
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const userIsSpeakingRef = useRef(false)
   // Transcript accumulators — buffer partial chunks, emit one entry per turn
   const partialAiTranscriptRef = useRef("")
   const partialCandidateTranscriptRef = useRef("")
@@ -118,10 +130,13 @@ export function useGeminiLiveSession({
     wasActiveRef.current = false
     aiHasSpokenRef.current = false
     aiHasAudioThisTurnRef.current = false
+    firstTurnDoneRef.current = false
     missedTurnCountRef.current = 0
     reconnectAttemptsRef.current = 0
     partialAiTranscriptRef.current = ""
     partialCandidateTranscriptRef.current = ""
+    if (silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null }
+    userIsSpeakingRef.current = false
     setStatus("closed")
     setIsAiSpeaking(false)
   }, [clearFirstResponseTimer])
@@ -135,6 +150,7 @@ export function useGeminiLiveSession({
       userClosedRef.current = false
       wasActiveRef.current = false
       aiHasSpokenRef.current = false
+      firstTurnDoneRef.current = false
       partialAiTranscriptRef.current = ""
       partialCandidateTranscriptRef.current = ""
       missedTurnCountRef.current = 0
@@ -168,9 +184,17 @@ export function useGeminiLiveSession({
           model: GEMINI_LIVE_MODEL,
           generationConfig: {
             responseModalities: ["AUDIO"],
+            mediaResolution: "MEDIA_RESOLUTION_LOW",
             speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } } },
           },
+          realtimeInputConfig: {
+            activityHandling: "START_OF_ACTIVITY_INTERRUPTS",
+            turnCoverage: "TURN_INCLUDES_ALL_INPUT",
+          },
           systemInstruction: { parts: [{ text: systemInstruction }] },
+          contextWindowCompression: { slidingWindow: {} },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
         },
       })
 
@@ -228,22 +252,24 @@ export function useGeminiLiveSession({
               aiHasAudioThisTurnRef.current = true
               player.enqueue(part.inlineData.data)
             }
-            // Capture text parts as AI transcript (gemini-3.1-flash-live outputs text in parts)
-            if (part.text && !msg.outputTranscription) {
+            // Capture text parts as AI transcript fallback (only when outputTranscription is absent)
+            if (part.text && !msg.serverContent?.outputTranscription) {
               partialAiTranscriptRef.current += part.text
             }
           }
 
           // Accumulate partial transcript chunks — Gemini streams tokens incrementally.
-          // Transcription fields arrive as TOP-LEVEL message keys (not under serverContent).
+          // Transcription fields arrive INSIDE serverContent (not top-level).
           // Emit a single entry per turn (on turnComplete) instead of one bubble per chunk.
-          if (msg.outputTranscription?.text) {
-            partialAiTranscriptRef.current += msg.outputTranscription.text
+          const sc = msg.serverContent
+          if (sc?.outputTranscription?.text) {
+            partialAiTranscriptRef.current += sc.outputTranscription.text
           }
-          if (msg.inputTranscription?.text) {
-            partialCandidateTranscriptRef.current += msg.inputTranscription.text
+          if (sc?.inputTranscription?.text) {
+            partialCandidateTranscriptRef.current += sc.inputTranscription.text
           }
           if (msg.serverContent?.turnComplete) {
+            firstTurnDoneRef.current = true
             if (partialCandidateTranscriptRef.current.trim()) {
               onTranscriptRef.current(partialCandidateTranscriptRef.current.trim(), "candidate")
               partialCandidateTranscriptRef.current = ""
@@ -320,9 +346,12 @@ export function useGeminiLiveSession({
             reconnectAttemptsRef.current = 0
             aiHasSpokenRef.current = false
             aiHasAudioThisTurnRef.current = false
+            firstTurnDoneRef.current = false
             missedTurnCountRef.current = 0
             partialAiTranscriptRef.current = ""
             partialCandidateTranscriptRef.current = ""
+            if (silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null }
+            userIsSpeakingRef.current = false
             return
           }
 
@@ -364,18 +393,60 @@ export function useGeminiLiveSession({
   const sendAudio = useCallback((pcm16: ArrayBuffer) => {
     const ws = wsRef.current
     if (!ws || ws.readyState !== WebSocket.OPEN) return
-    // Barge-in: clear AI audio queue when user sends audio while AI is speaking
-    if (playerRef.current?.speaking) playerRef.current.clear()
+    // Gate mic→WS until AI's first turn completes to prevent greeting interruption
+    if (!firstTurnDoneRef.current) return
+
+    // Compute RMS energy of this audio chunk
+    const samples = new Int16Array(pcm16)
+    let sumSq = 0
+    for (let i = 0; i < samples.length; i++) sumSq += samples[i] * samples[i]
+    const rms = Math.sqrt(sumSq / samples.length)
+
+    // While AI is speaking, gate low-energy audio to prevent echo/ambient noise
+    // from triggering barge-in. Only let through high-energy audio (intentional barge-in).
+    if (playerRef.current?.speaking) {
+      if (rms <= 2000) return
+      playerRef.current.clear() // intentional barge-in — clear local playback
+    }
+
+    // Send audio to Gemini
     ws.send(JSON.stringify({
       realtimeInput: {
         audio: { data: arrayBufferToBase64(pcm16), mimeType: "audio/pcm;rate=16000" },
       },
     }))
+
+    // ── Client-side silence detection (manual turn management) ──────────
+    // Since server-side VAD is disabled, we control when the user's turn ends
+    // by sending audioStreamEnd after SILENCE_BEFORE_TURN_END_MS of silence.
+    const isSpeech = rms > SPEECH_RMS_THRESHOLD
+
+    if (isSpeech) {
+      userIsSpeakingRef.current = true
+      // Clear any pending silence timer — user is still talking
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current)
+        silenceTimerRef.current = null
+      }
+    } else if (userIsSpeakingRef.current && !silenceTimerRef.current) {
+      // User was speaking but now silent — start countdown
+      silenceTimerRef.current = setTimeout(() => {
+        silenceTimerRef.current = null
+        userIsSpeakingRef.current = false
+        // Signal end of user's turn to Gemini
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          console.log("[gemini-ws] silence timeout — sending audioStreamEnd")
+          wsRef.current.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }))
+        }
+      }, SILENCE_BEFORE_TURN_END_MS)
+    }
   }, [])
 
   const sendVideo = useCallback((jpegBase64: string) => {
     const ws = wsRef.current
     if (!ws || ws.readyState !== WebSocket.OPEN) return
+    // Skip video frames while AI is speaking to avoid interrupting its turn
+    if (playerRef.current?.speaking) return
     ws.send(JSON.stringify({
       realtimeInput: {
         video: { data: jpegBase64, mimeType: "image/jpeg" },
@@ -399,6 +470,10 @@ export function useGeminiLiveSession({
     await playerRef.current.warmUp()
   }, [])
 
-  return { status, connect, disconnect, sendAudio, sendVideo, sendText, isAiSpeaking, warmUpAudio }
+  const getAiAudioStream = useCallback((): MediaStream | null => {
+    return playerRef.current.getOutputStream()
+  }, [])
+
+  return { status, connect, disconnect, sendAudio, sendVideo, sendText, isAiSpeaking, warmUpAudio, getAiAudioStream }
 }
 

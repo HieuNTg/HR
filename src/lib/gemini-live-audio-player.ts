@@ -13,6 +13,10 @@ const LOOKAHEAD_S = 0.05 // 50ms
 
 export class GeminiAudioPlayer {
   private ctx: AudioContext | null = null
+  // Gain bus — every scheduled source connects here; the bus fans out to the speakers
+  // (ctx.destination) AND a MediaStreamAudioDestinationNode for recording capture.
+  private outputBus: GainNode | null = null
+  private recordDest: MediaStreamAudioDestinationNode | null = null
   private nextPlayTime = 0
   private isPlaying = false
   private pendingChunks = 0
@@ -23,6 +27,10 @@ export class GeminiAudioPlayer {
   // Buffer chunks received while AudioContext is suspended, replay on resume
   private suspendBuffer: string[] = []
   private skippedChunks = 0
+  // Drain timer — delays onPlayEnd by DRAIN_DELAY_MS after last chunk ends,
+  // preventing `speaking` from flickering false between streamed chunks.
+  private drainTimer: ReturnType<typeof setTimeout> | null = null
+  private static readonly DRAIN_DELAY_MS = 500
 
   onPlayStart?: () => void
   onPlayEnd?: () => void
@@ -30,8 +38,18 @@ export class GeminiAudioPlayer {
   private ensureContext(): AudioContext {
     if (!this.ctx || this.ctx.state === "closed") {
       this.ctx = new AudioContext({ sampleRate: GEMINI_OUTPUT_SAMPLE_RATE })
+      this.outputBus = this.ctx.createGain()
+      this.outputBus.connect(this.ctx.destination)
+      this.recordDest = this.ctx.createMediaStreamDestination()
+      this.outputBus.connect(this.recordDest)
     }
     return this.ctx
+  }
+
+  /** MediaStream carrying all AI audio — for mixing into a recorder stream */
+  getOutputStream(): MediaStream | null {
+    this.ensureContext()
+    return this.recordDest?.stream ?? null
   }
 
   /** Decode base64 PCM16 → Float32Array (uses shared audio-utils to avoid duplication) */
@@ -47,6 +65,12 @@ export class GeminiAudioPlayer {
 
   /** Enqueue and schedule a PCM16 audio chunk for gapless playback */
   enqueue(base64Pcm16: string): void {
+    // Cancel pending drain — new chunk arrived before the gap expired
+    if (this.drainTimer) {
+      clearTimeout(this.drainTimer)
+      this.drainTimer = null
+    }
+
     const ctx = this.ensureContext()
     // Buffer chunks while suspended — replay when context resumes
     if (ctx.state === "suspended") {
@@ -68,7 +92,7 @@ export class GeminiAudioPlayer {
 
     const source = ctx.createBufferSource()
     source.buffer = buffer
-    source.connect(ctx.destination)
+    source.connect(this.outputBus ?? ctx.destination)
 
     // Schedule after previous chunk ends — gapless.
     // If nextPlayTime has already passed (late chunk due to network jitter), add LOOKAHEAD_S
@@ -95,9 +119,17 @@ export class GeminiAudioPlayer {
       this.pendingChunks--
       if (this.pendingChunks <= 0) {
         this.pendingChunks = 0
-        this.isPlaying = false
-        this.nextPlayTime = 0
-        this.onPlayEnd?.()
+        // Don't fire onPlayEnd immediately — wait for potential next chunk.
+        // This prevents `speaking` from flickering false between streamed chunks,
+        // which would un-gate the mic and cause false barge-ins on 2nd+ turns.
+        this.drainTimer = setTimeout(() => {
+          this.drainTimer = null
+          if (this.pendingChunks <= 0 && !signal.aborted) {
+            this.isPlaying = false
+            this.nextPlayTime = 0
+            this.onPlayEnd?.()
+          }
+        }, GeminiAudioPlayer.DRAIN_DELAY_MS)
       }
     }
   }
@@ -113,6 +145,12 @@ export class GeminiAudioPlayer {
 
   /** Stop all playback immediately (barge-in / interrupt) */
   clear(): void {
+    // Cancel drain timer first
+    if (this.drainTimer) {
+      clearTimeout(this.drainTimer)
+      this.drainTimer = null
+    }
+
     // Abort all pending onended callbacks
     this.abortController.abort()
     this.abortController = new AbortController()
@@ -142,5 +180,7 @@ export class GeminiAudioPlayer {
     this.clear()
     this.ctx?.close()
     this.ctx = null
+    this.outputBus = null
+    this.recordDest = null
   }
 }
