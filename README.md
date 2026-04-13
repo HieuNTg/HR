@@ -13,6 +13,7 @@ npm install
 
 # 2. Khởi động hạ tầng (Postgres + Redis + MinIO)
 docker compose up -d
+# ↑ Không có Docker? → xem phần "Không dùng Docker? (chạy native)" bên dưới
 
 # 3. Tạo .env từ template, điền GEMINI_API_KEY
 cp .env.example .env
@@ -89,6 +90,68 @@ docker compose down -v  # dừng + xoá data (reset sạch)
 ```
 
 **MinIO Console:** http://localhost:9001 (login: `minioadmin` / `minioadmin`)
+
+---
+
+## 🖥️ Không dùng Docker? (chạy native)
+
+Chỉ **PostgreSQL là BẮT BUỘC**. Redis/MinIO optional (app lazy-connect, không crash nếu thiếu — chỉ `/api/health` báo `degraded`).
+
+### PostgreSQL (bắt buộc)
+
+**Windows:**
+```powershell
+# Scoop
+scoop install postgresql
+
+# hoặc Chocolatey
+choco install postgresql16
+
+# hoặc tải installer: https://www.postgresql.org/download/windows/
+```
+
+**macOS:** `brew install postgresql@16 && brew services start postgresql@16`
+
+**Linux (Debian/Ubuntu):** `sudo apt install postgresql-16 && sudo systemctl start postgresql`
+
+Tạo database + user:
+
+```bash
+psql -U postgres
+CREATE DATABASE hr_interview;
+CREATE USER hr WITH PASSWORD 'hr';
+GRANT ALL PRIVILEGES ON DATABASE hr_interview TO hr;
+\q
+```
+
+Đổi `.env`:
+```env
+DATABASE_URL="postgresql://hr:hr@localhost:5432/hr_interview"
+```
+
+### Redis (optional)
+
+Nếu không cài → bỏ qua hoặc comment dòng `REDIS_URL` trong `.env`. Health check báo `degraded` nhưng app vẫn chạy.
+
+**Windows:** dùng [Memurai](https://www.memurai.com/) (Redis-compatible cho Windows) hoặc WSL.
+**macOS:** `brew install redis && brew services start redis`
+**Linux:** `sudo apt install redis-server`
+
+### MinIO (không cần cho flow hiện tại)
+
+Không có file nào trong `src/` thực sự gọi MinIO → skip hoàn toàn. Giữ giá trị mặc định trong `.env` cũng OK (không kết nối thì không lỗi). Audio phỏng vấn upload trực tiếp lên Gemini Files API (tự hết hạn 48h), CV hiện lưu tạm vào thư mục `uploads/` local.
+
+### Kiểm tra
+
+```bash
+# Postgres đã chạy chưa
+psql "postgresql://hr:hr@localhost:5432/hr_interview" -c "SELECT 1;"
+
+# Redis (nếu có)
+redis-cli ping   # → PONG
+```
+
+Sau đó chạy `npx prisma db push && npx prisma db seed && npm run dev`.
 
 ---
 
