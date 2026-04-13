@@ -1,63 +1,65 @@
 # HR Interview System
 
-AI-powered recruitment system: job analysis, candidate matching, AI interviews (text/voice via Gemini Live), scoring & recommendations.
+Hệ thống tuyển dụng AI: phân tích JD, matching CV, phỏng vấn AI (text/voice/video qua Gemini Live), chấm điểm & đề xuất.
 
-## Tech Stack
+---
 
-- **Framework:** Next.js 16 (App Router)
-- **Language:** TypeScript
-- **Database:** PostgreSQL 16 + Prisma ORM
-- **Cache/Queue:** Redis 7 + BullMQ
-- **AI:** Google Gemini (`@google/genai`)
-- **Auth:** NextAuth v5
-- **Storage:** MinIO (S3-compatible)
-- **State:** Zustand + TanStack Query
-- **UI:** Tailwind CSS v4 + Lucide Icons
-
-## Prerequisites
-
-- Node.js >= 20
-- Docker & Docker Compose
-- Gemini API Key ([Google AI Studio](https://aistudio.google.com/apikey))
-
-## Getting Started
-
-### 1. Clone & Install
+## ⚡ Quick Start (5 phút)
 
 ```bash
-git clone <repo-url>
-cd HR-Interview
+# 1. Clone & install
+git clone <repo-url> && cd HR-Interview
 npm install
-```
 
-### 2. Start Infrastructure
-
-```bash
+# 2. Khởi động hạ tầng (Postgres + Redis + MinIO)
 docker compose up -d
-```
 
-Services khởi động:
-
-| Service    | Port          | Mô tả                  |
-| ---------- | ------------- | ----------------------- |
-| PostgreSQL | 5432          | Database chính          |
-| Redis      | 6379          | Cache & job queue       |
-| MinIO      | 9000 / 9001   | Object storage / Console|
-
-### 3. Environment Variables
-
-```bash
+# 3. Tạo .env từ template, điền GEMINI_API_KEY
 cp .env.example .env
+# Mở .env, set GEMINI_API_KEY=... (lấy tại https://aistudio.google.com/apikey)
+# Tạo NEXTAUTH_SECRET: npx auth secret    (hoặc: openssl rand -base64 32)
+
+# 4. Khởi tạo database
+npx prisma generate
+npx prisma db push
+npx prisma db seed
+
+# 5. Chạy dev server
+npm run dev
 ```
 
-Chỉnh sửa `.env`:
+Mở **http://localhost:3000** → xong.
+
+---
+
+## 📋 Yêu cầu
+
+| Phần mềm               | Version    | Ghi chú                                              |
+| ---------------------- | ---------- | ---------------------------------------------------- |
+| Node.js                | ≥ 20       | Nên dùng LTS (20 hoặc 22)                            |
+| Docker + Docker Compose| Mới nhất   | Chạy Postgres / Redis / MinIO                        |
+| Gemini API Key         | Miễn phí   | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
+| Trình duyệt            | Chrome 120+| Cho voice/video interview (WebAudio + getUserMedia)  |
+
+---
+
+## 🔧 Cấu hình `.env`
+
+Sau khi `cp .env.example .env`, chỉnh các giá trị sau:
 
 ```env
+# Database (khớp với docker-compose.yml — không cần đổi nếu dùng Docker local)
 DATABASE_URL="postgresql://postgres:postgres@localhost:5432/hr_interview"
 REDIS_URL="redis://localhost:6379"
-NEXTAUTH_SECRET="generate-a-secret-here"    # openssl rand -base64 32
+
+# Auth — BẮT BUỘC set
+NEXTAUTH_SECRET="<<chạy: npx auth secret>>"
 NEXTAUTH_URL="http://localhost:3000"
-GEMINI_API_KEY="your-gemini-api-key"
+
+# Gemini — BẮT BUỘC
+GEMINI_API_KEY="<<dán key từ Google AI Studio>>"
+
+# MinIO (object storage cho CV + audio interview)
 MINIO_ENDPOINT="localhost"
 MINIO_PORT=9000
 MINIO_ACCESS_KEY="minioadmin"
@@ -65,64 +67,115 @@ MINIO_SECRET_KEY="minioadmin"
 MINIO_BUCKET="hr-interview"
 ```
 
-### 4. Database Setup
+---
+
+## 🐳 Hạ tầng Docker
+
+`docker compose up -d` khởi động:
+
+| Service    | Cổng        | Mô tả                       |
+| ---------- | ----------- | --------------------------- |
+| PostgreSQL | 5432        | Database chính              |
+| Redis      | 6379        | Cache + BullMQ job queue    |
+| MinIO      | 9000 / 9001 | S3 storage / Web console    |
+
+Kiểm tra trạng thái:
 
 ```bash
-npx prisma generate
-npx prisma db push
-npx prisma db seed
+docker compose ps       # health status
+docker compose logs -f  # theo dõi log
+docker compose down     # dừng (giữ data)
+docker compose down -v  # dừng + xoá data (reset sạch)
 ```
 
-### 5. Run Development Server
+**MinIO Console:** http://localhost:9001 (login: `minioadmin` / `minioadmin`)
+
+---
+
+## 🗄️ Database
 
 ```bash
-npm run dev
+npx prisma generate   # sinh Prisma Client (chạy sau mỗi lần đổi schema)
+npx prisma db push    # sync schema → DB (dev; không tạo migration)
+npx prisma db seed    # nạp dữ liệu mẫu (user admin, JD mẫu, ...)
+npx prisma studio     # UI xem/sửa data (http://localhost:5555)
 ```
 
-Mở [http://localhost:3000](http://localhost:3000).
+Đổi schema → chạy lại `prisma generate && prisma db push`.
 
-## Scripts
+---
 
-| Command           | Mô tả                          |
-| ----------------- | ------------------------------- |
-| `npm run dev`     | Dev server (hot reload)         |
-| `npm run build`   | Production build                |
-| `npm run start`   | Start production server         |
-| `npm run lint`    | ESLint check                    |
+## 🚀 Scripts
 
-## Project Structure
+| Lệnh              | Mục đích                       |
+| ----------------- | ------------------------------ |
+| `npm run dev`     | Dev server + Turbopack HMR     |
+| `npm run build`   | Production build               |
+| `npm run start`   | Chạy production (sau `build`)  |
+| `npm run lint`    | ESLint                         |
+
+---
+
+## 🧪 Test luồng chính
+
+1. **Đăng nhập** bằng account seed (xem `prisma/seed.ts`).
+2. **Tạo Job Description** → AI phân tích & gợi ý câu hỏi.
+3. **Upload CV ứng viên** → embedding matching.
+4. **Bắt đầu phỏng vấn:**
+   - **Text:** chat-based, có đánh giá realtime.
+   - **Voice/Video:** yêu cầu cấp quyền mic + camera, dùng Gemini Live qua WebSocket.
+5. **Kết thúc** → audio cuộc phỏng vấn upload lên Gemini Files API → AI chấm điểm + sinh report đầy đủ.
+
+---
+
+## 📁 Cấu trúc project
 
 ```
 src/
-├── app/                  # Next.js App Router (pages & API routes)
-│   ├── (dashboard)/      # Dashboard pages
-│   └── api/              # API endpoints
-├── components/           # React components
-│   └── interview/        # Interview UI (chat, video, avatar)
-├── hooks/                # Custom hooks (media capture, Gemini live)
-├── lib/                  # Services & utilities (Gemini client, auth)
-├── stores/               # Zustand stores
-└── generated/            # Prisma generated client
+├── app/
+│   ├── (dashboard)/      # Trang dashboard (jobs, candidates, interviews, report)
+│   └── api/              # API routes (interviews, auth, uploads, live-token)
+├── components/interview/ # UI phỏng vấn (chat, video, avatar, chat bubbles)
+├── hooks/                # useMediaCapture, useGeminiLiveSession
+├── lib/
+│   ├── gemini.ts                   # Gemini client (text/JSON/multimodal/files)
+│   ├── gemini-live-audio-player.ts # PCM16 playback + stream tap để ghi audio
+│   ├── services/                   # Business logic (interview AI, matching, ...)
+│   └── video-utils.ts              # Capture frame helper
+├── stores/               # Zustand (interview flow state)
+└── generated/            # Prisma Client (auto-gen, đừng sửa)
 prisma/
-├── schema.prisma         # Database schema
-└── seed.ts               # Seed data
+├── schema.prisma
+└── seed.ts
+docker-compose.yml        # Postgres + Redis + MinIO
 ```
 
-## Key Features
+---
 
-- **Text Interview:** Chat-based AI interview với đánh giá realtime
-- **Voice/Video Interview:** Gemini Live API với WebSocket streaming, PCM audio, camera capture
-- **Job Analysis:** AI phân tích JD, tự động tạo câu hỏi phỏng vấn
-- **Candidate Matching:** Embedding-based CV matching
-- **Evaluation:** AI scoring theo nhiều tiêu chí
+## 🐛 Troubleshooting
 
-## MinIO Console
+| Triệu chứng                                 | Cách xử lý                                                              |
+| ------------------------------------------- | ----------------------------------------------------------------------- |
+| `ECONNREFUSED 5432/6379/9000`               | `docker compose ps` — service chưa up. Chạy `docker compose up -d`.     |
+| `Prisma Client not generated`               | `npx prisma generate`                                                   |
+| Schema drift / DB trống                     | `npx prisma db push && npx prisma db seed`                              |
+| `GEMINI_API_KEY environment variable is not set` | Chưa set key trong `.env` — restart dev server sau khi sửa.        |
+| `uploadFile is not a function` trên dev     | Module cache stale sau HMR — **restart dev server** (`Ctrl+C` → `npm run dev`). |
+| Voice interview im lặng / không nghe AI     | Chrome block autoplay — bấm "Bắt đầu phỏng vấn" để unlock AudioContext. |
+| Mic không bắt tiếng                         | Kiểm tra quyền trình duyệt + `chrome://settings/content/microphone`.    |
+| Port conflict (5432/6379/9000/9001/3000)    | Đổi port mapping trong `docker-compose.yml` hoặc tắt service đang chạy. |
+| Report sinh chậm / timeout                  | Audio dài → Gemini Files processing lâu. Đã set `maxDuration = 180`s.  |
 
-Truy cập MinIO Console tại [http://localhost:9001](http://localhost:9001) với credentials `minioadmin/minioadmin`.
+---
 
-## Troubleshooting
+## 🛠 Tech Stack
 
-- **DB connection failed:** Kiểm tra Docker containers đang chạy (`docker compose ps`)
-- **Prisma generate error:** Chạy `npx prisma generate` trước khi `npm run dev`
-- **Gemini API error:** Verify `GEMINI_API_KEY` trong `.env`
-- **Port conflict:** Đổi port mapping trong `docker-compose.yml`
+Next.js 16 (App Router) · TypeScript · PostgreSQL 16 + Prisma 7 · Redis 7 + BullMQ · Google Gemini (`@google/genai`) · NextAuth v5 · MinIO · Zustand + TanStack Query · Tailwind CSS v4 · Lucide Icons
+
+---
+
+## 📚 Tài liệu bổ sung
+
+- `docs/` — PDR, code standards, system architecture, codebase summary
+- `plans/` — implementation plans và reports
+- `CLAUDE.md` — hướng dẫn AI assistant khi làm việc trên repo
